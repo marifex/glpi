@@ -35,6 +35,7 @@
 
 namespace Glpi\Dashboard;
 
+use Agent;
 use CommonDBTM;
 use CommonDevice;
 use CommonITILObject;
@@ -308,6 +309,66 @@ final class FakeProvider extends Provider
         ];
     }
 
+    public static function ticketsBySla(array $params = []): array
+    {
+        $labels = [
+            _x('fake_data', 'Incident priority 1'),
+            _x('fake_data', 'Incident priority 2'),
+            _x('fake_data', 'Standard request'),
+            _x('fake_data', 'VIP support'),
+        ];
+
+        $series = [];
+        foreach ([__('On time') => 60, __('Late') => 15] as $serie_name => $max) {
+            $series[] = [
+                'name' => $serie_name,
+                'data' => array_map(
+                    static fn(string $label) => ['value' => self::getObscureNumberForString($serie_name . $label, $max), 'url' => ''],
+                    $labels
+                ),
+            ];
+        }
+
+        return [
+            'data'  => [
+                'labels' => $labels,
+                'series' => $series,
+            ],
+            'label' => $params['label'] ?? '',
+            'icon'  => 'ti ti-stopwatch',
+        ];
+    }
+
+    public static function ticketsBySlaAndCategory(array $params = []): array
+    {
+        $labels = [
+            _x('fake_data', 'Software > Office suite'),
+            _x('fake_data', 'Hardware > Printer'),
+            _x('fake_data', 'Network > VPN'),
+            _x('fake_data', 'Hardware > Laptop'),
+        ];
+
+        $series = [];
+        foreach ([__('On time') => 60, __('Late') => 15] as $serie_name => $max) {
+            $series[] = [
+                'name' => $serie_name,
+                'data' => array_map(
+                    static fn(string $label) => ['value' => self::getObscureNumberForString($serie_name . $label, $max), 'url' => ''],
+                    $labels
+                ),
+            ];
+        }
+
+        return [
+            'data'  => [
+                'labels' => $labels,
+                'series' => $series,
+            ],
+            'label' => $params['label'] ?? '',
+            'icon'  => 'ti ti-stopwatch',
+        ];
+    }
+
     public static function ticketsByCategoryTree(array $params = []): array
     {
         $tree = [
@@ -463,6 +524,26 @@ final class FakeProvider extends Provider
         ];
     }
 
+    public static function ticketsOpenedAndClosed(array $params = []): array
+    {
+        return [
+            'data'  => [
+                [
+                    'number' => 318,
+                    'label'  => _x('status', 'Not solved'),
+                    'url'    => '',
+                ],
+                [
+                    'number' => 1247,
+                    'label'  => _x('status', 'Solved + Closed'),
+                    'url'    => '',
+                ],
+            ],
+            'label' => $params['label'] ?? '',
+            'icon'  => Ticket::getIcon(),
+        ];
+    }
+
     public static function ticketsBacklog(string $period = 'month', array $params = []): array
     {
         $labels = [];
@@ -514,6 +595,39 @@ final class FakeProvider extends Provider
         ];
     }
 
+    public static function ticketsBySlaEvolution(string $period = 'month', array $params = []): array
+    {
+        $labels = [];
+        for ($i = 11; $i >= 0; $i--) {
+            $labels[] = match ($period) {
+                'day'   => date('Y-m-d', strtotime("-$i days")),
+                'week'  => date('o-\WW', strtotime("-$i weeks")),
+                'year'  => date('Y', strtotime("-$i years")),
+                default => date('Y-m', strtotime("-$i months")),
+            };
+        }
+
+        $series = [];
+        foreach ([__('On time') => 60, __('Late') => 15] as $serie_name => $max) {
+            $series[] = [
+                'name' => $serie_name,
+                'data' => array_map(
+                    static fn(string $label) => ['value' => self::getObscureNumberForString($serie_name . $label, $max) + 5, 'url' => ''],
+                    $labels
+                ),
+            ];
+        }
+
+        return [
+            'data'  => [
+                'labels' => $labels,
+                'series' => $series,
+            ],
+            'label' => $params['label'] ?? '',
+            'icon'  => 'ti ti-stopwatch',
+        ];
+    }
+
     public static function nbItemByFk(?CommonDBTM $item = null, ?CommonDBTM $fk_item = null, array $params = []): array
     {
         $item_counts = self::getItemCount();
@@ -542,6 +656,24 @@ final class FakeProvider extends Provider
         ];
     }
 
+    public static function computersByAgentVersion(array $params = []): array
+    {
+        $data = [];
+        foreach (['1.11' => 800, '1.10' => 300, '1.9' => 120, '1.7.3' => 40] as $version => $max) {
+            $data[] = [
+                'number' => self::getObscureNumberForString('agent' . $version, $max),
+                'label'  => (string) $version,
+                'url'    => '#',
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'] ?? '',
+            'icon'  => Agent::getIcon(),
+        ];
+    }
+
     public static function articleListItem(?CommonDBTM $item = null, array $params = []): array
     {
         $data = [];
@@ -564,6 +696,51 @@ final class FakeProvider extends Provider
             'url'    => $item::getSearchURL(),
             'label'  => sprintf(__('List of %s'), $item::getTypeName(Session::getPluralNumber())),
             'icon'   => $item::getIcon(),
+        ];
+    }
+
+    public static function computersByOperatingSystemVersion(string $family = 'windows', string $group_by = 'version', array $params = []): array
+    {
+        $labels = match ($family . '-' . $group_by) {
+            'linux-name'    => ['Ubuntu', 'Debian GNU/Linux', 'Red Hat Enterprise Linux', 'Rocky Linux'],
+            'linux-version' => ['Ubuntu 24.04', 'Ubuntu 22.04', 'Debian GNU/Linux 12', 'Red Hat Enterprise Linux 9.4'],
+            'macos-major'   => ['macOS 15', 'macOS 14', 'macOS 13', 'Mac OS X 10.15'],
+            'macos-version' => ['macOS 15.1', 'macOS 14.7', 'macOS 13.6', 'Mac OS X 10.15.7'],
+            default         => ['Microsoft Windows 11 Professionnel 23H2', 'Microsoft Windows 11 Professionnel 24H2', 'Microsoft Windows 10 Professionnel 22H2', 'Microsoft Windows Server 2022 Standard'],
+        };
+
+        $data = [];
+        foreach ($labels as $label) {
+            $data[] = [
+                'number' => self::getObscureNumberForString($label, 300),
+                'label'  => $label,
+                'url'    => '#',
+            ];
+        }
+        usort($data, static fn(array $a, array $b): int => $b['number'] <=> $a['number']);
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'] ?? '',
+            'icon'  => Computer::getIcon(),
+        ];
+    }
+
+    public static function computersByMonitorsNumber(array $params = []): array
+    {
+        $data = [];
+        foreach ([0 => 120, 1 => 600, 2 => 300, 3 => 40] as $nb_monitors => $max) {
+            $data[] = [
+                'number' => self::getObscureNumberForString('monitors' . $nb_monitors, $max),
+                'label'  => sprintf(_n('%d monitor', '%d monitors', $nb_monitors), $nb_monitors),
+                'url'    => '',
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'] ?? '',
+            'icon'  => Monitor::getIcon(),
         ];
     }
 
@@ -651,6 +828,25 @@ final class FakeProvider extends Provider
             ],
             'label' => $params['label'] ?? '',
             'icon'  => Ticket::getIcon(),
+        ];
+    }
+
+    public static function ticketsByAssignedGroupChanges(array $params = []): array
+    {
+        $data = [];
+        // Fewer tickets as the number of changes grows
+        foreach ([60, 25, 10, 4, 1] as $nb_changes => $max) {
+            $data[] = [
+                'number' => self::getObscureNumberForString('group changes ' . $nb_changes, $max) + $max,
+                'label'  => sprintf(_n('%d change', '%d changes', $nb_changes), $nb_changes),
+                'url'    => '',
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'] ?? '',
+            'icon'  => Group::getIcon(),
         ];
     }
 
@@ -824,6 +1020,36 @@ final class FakeProvider extends Provider
             ],
             'label' => $params['label'] ?? '',
             'icon'  => Ticket::getIcon(),
+        ];
+    }
+
+    public static function ticketsActionTimeVsSolveDelay(string $period = 'month', array $params = []): array
+    {
+        $labels = [];
+        for ($i = 11; $i >= 0; $i--) {
+            $labels[] = match ($period) {
+                'day'   => date('Y-m-d', strtotime("-$i days")),
+                'week'  => date('o-\WW', strtotime("-$i weeks")),
+                'year'  => date('Y', strtotime("-$i years")),
+                default => date('Y-m', strtotime("-$i months")),
+            };
+        }
+
+        return [
+            'data'  => [
+                'labels' => $labels,
+                'series' => [
+                    [
+                        'name' => __("Tasks duration / solve delay (%)"),
+                        'data' => array_map(
+                            static fn(string $label) => self::getObscureNumberForString('actiontime' . $label, 40) + 10,
+                            $labels
+                        ),
+                    ],
+                ],
+            ],
+            'label' => $params['label'] ?? '',
+            'icon'  => "ti ti-stopwatch",
         ];
     }
 

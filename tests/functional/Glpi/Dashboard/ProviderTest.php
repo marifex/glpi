@@ -34,6 +34,7 @@
 
 namespace tests\units\Glpi\Dashboard;
 
+use Glpi\Asset\Asset_PeripheralAsset;
 use Glpi\CustomAsset\Test01Asset;
 use Glpi\CustomAsset\Test01AssetType;
 use Glpi\Dashboard\FakeProvider;
@@ -41,6 +42,8 @@ use Glpi\Dashboard\Filters\DatesFilter;
 use Glpi\Dashboard\Filters\GroupRequesterFilter;
 use Glpi\Dashboard\Filters\GroupTechFilter;
 use Glpi\Dashboard\Filters\ItilCategoryFilter;
+use Glpi\Dashboard\Filters\SlaFilter;
+use Glpi\Dashboard\Filters\StateFilter;
 use Glpi\Dashboard\Filters\TicketStatusFilter;
 use Glpi\Dashboard\Filters\UserTechFilter;
 use Glpi\Dashboard\Provider;
@@ -658,6 +661,300 @@ class ProviderTest extends DbTestCase
         ];
         $this->assertEquals($expected, $output);
     }
+
+    public function testTicketsBySla(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $slm       = $this->createItem(\SLM::class, ['name' => 'test dashboard tickets by sla']);
+        $slas      = [];
+        foreach (['A' => \SLM::TTR, 'B' => \SLM::TTR, 'C' => \SLM::TTO] as $letter => $type) {
+            $slas[$letter] = $this->createItem(\SLA::class, [
+                'name'            => "test dashboard sla $letter",
+                'type'            => $type,
+                'number_time'     => 4,
+                'definition_time' => 'hour',
+                'slms_id'         => $slm->getID(),
+            ]);
+        }
+
+        $tickets_ids = [];
+        // Dates far in the past so that no other ticket of the test database is counted
+        foreach (
+            [
+                'A on time'      => ['A', \Ticket::SOLVED, '2010-01-06 10:00:00', '2010-01-05 12:00:00'],
+                'A on time at midnight' => ['A', \Ticket::SOLVED, '2010-01-06 10:00:00', '2010-01-05 12:00:00', '2010-01-01 00:00:00'],
+                'A late solved'  => ['A', \Ticket::SOLVED, '2010-01-05 11:00:00', '2010-01-05 12:00:00'],
+                'A late closed'  => ['A', \Ticket::CLOSED, '2010-01-05 11:00:00', '2010-01-05 12:00:00'],
+                'B on time'      => ['B', \Ticket::CLOSED, '2010-01-06 10:00:00', '2010-01-05 12:00:00', '2010-01-05 10:00:00', 'C'],
+                'B not solved'   => ['B', \Ticket::ASSIGNED, '2010-01-05 11:00:00', null],
+                'without SLA'    => [null, \Ticket::SOLVED, null, '2010-01-05 12:00:00'],
+                // Only its time to own SLA matches C, it is not solved
+                'A with C to own' => ['A', \Ticket::ASSIGNED, '2010-01-05 11:00:00', null, '2010-01-05 10:00:00', 'C'],
+            ] as $name => $values
+        ) {
+            [$letter, $status, $time_to_resolve, $solvedate] = $values;
+            $date        = $values[4] ?? '2010-01-05 10:00:00';
+            $tto_letter  = $values[5] ?? null;
+            $ticket = $this->createItem(\Ticket::class, [
+                'name'        => "test dashboard tickets by sla $name",
+                'content'     => 'blablabla',
+                'entities_id' => $entity_id,
+            ]);
+            $DB->update(\Ticket::getTable(), [
+                'date'            => $date,
+                'slas_id_tto'     => $tto_letter !== null ? $slas[$tto_letter]->getID() : 0,
+                'status'          => $status,
+                'slas_id_ttr'     => $letter !== null ? $slas[$letter]->getID() : 0,
+                'time_to_resolve' => $time_to_resolve,
+                'solvedate'       => $solvedate,
+            ], ['id' => $ticket->getID()]);
+            $tickets_ids[$name] = $ticket->getID();
+        }
+
+        $dates_filter = [DatesFilter::getId() => ['2010-01-01', '2010-01-31']];
+        $get_values   = static function (array $result): array {
+            $values = [];
+            foreach ($result['data']['series'] as $serie) {
+                $values[$serie['name']] = array_column($serie['data'], 'value');
+            }
+            return $values;
+        };
+
+        // Only solved and closed tickets with a SLA are counted, not solved tickets are ignored
+        $result = Provider::ticketsBySla(['apply_filters' => $dates_filter]);
+        $this->assertSame(['test dashboard sla A', 'test dashboard sla B'], $result['data']['labels']);
+        // Both series are always returned, in a fixed order, so colors stay consistent
+        $this->assertSame(['On time' => [2, 1], 'Late' => [2, 0]], $get_values($result));
+
+        // The search of a bar finds the tickets counted
+        foreach (
+            [
+                [0, 0, 2], // SLA A on time, including the ticket created at the first second of the dates filter
+                [1, 0, 2], // SLA A late
+                [1, 1, 0], // SLA B late
+            ] as [$serie_index, $label_index, $expected]
+        ) {
+            $url = $result['data']['series'][$serie_index]['data'][$label_index]['url'];
+            parse_str((string) parse_url($url, PHP_URL_QUERY), $search_params);
+            $search_data = \Search::getDatas(\Ticket::class, \Search::manageParams(\Ticket::class, $search_params));
+            $this->assertSame($expected, $search_data['data']['totalcount'], $url);
+        }
+
+        // The status filter is intersected with the solved statuses
+        $closed = Provider::ticketsBySla(['apply_filters' => $dates_filter + [TicketStatusFilter::getId() => \Ticket::CLOSED]]);
+        $this->assertSame(['On time' => [0, 1], 'Late' => [1, 0]], $get_values($closed));
+        $this->assertTrue(Provider::ticketsBySla([
+            'apply_filters' => $dates_filter + [TicketStatusFilter::getId() => \Ticket::ASSIGNED],
+        ])['data']['nodata'] ?? false);
+
+        // The SLA filter restricts the bars to the selected SLA
+        $filtered = Provider::ticketsBySla(['apply_filters' => $dates_filter + [SlaFilter::getId() => $slas['B']->getID()]]);
+        $this->assertSame(['test dashboard sla B'], $filtered['data']['labels']);
+        $this->assertSame(['On time' => [1], 'Late' => [0]], $get_values($filtered));
+
+        // The SLA filter matches the time to own SLA too
+        $filtered = Provider::ticketsBySla(['apply_filters' => $dates_filter + [SlaFilter::getId() => $slas['C']->getID()]]);
+        $this->assertSame(['test dashboard sla B'], $filtered['data']['labels']);
+        $this->assertSame(['On time' => [1], 'Late' => [0]], $get_values($filtered));
+        // It is searched as "time to own OR time to resolve", which must not bypass the other criteria of the bar
+        parse_str((string) parse_url($filtered['data']['series'][0]['data'][0]['url'], PHP_URL_QUERY), $search_params);
+        $search_data = \Search::getDatas(\Ticket::class, \Search::manageParams(\Ticket::class, $search_params));
+        $this->assertSame(1, $search_data['data']['totalcount'], 'the not solved ticket with C to own must not be found');
+
+        // Without any ticket right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname]           = 0;
+        $_SESSION['glpiactiveprofile'][TicketValidation::$rightname] = 0;
+        $this->assertTrue(Provider::ticketsBySla(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The update right alone doesn't allow to see tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = UPDATE;
+        $this->assertTrue(Provider::ticketsBySla(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The new tickets right alone only allows to see new tickets, which are not solved
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READNEWTICKET;
+        $this->assertTrue(Provider::ticketsBySla(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The "my tickets" right only allows to see the tickets the user is actor of
+        $hidden_id = $tickets_ids['A late closed'];
+        $DB->update(\Ticket::getTable(), ['users_id_recipient' => 0], ['id' => $hidden_id]);
+        $DB->delete(\Ticket_User::getTable(), ['tickets_id' => $hidden_id]);
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READMY;
+        $mine = Provider::ticketsBySla(['apply_filters' => $dates_filter]);
+        $this->assertSame(['On time' => [2, 1], 'Late' => [1, 0]], $get_values($mine), 'ticket of another user must not be counted');
+    }
+
+    public function testFakeTicketsBySla(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'ticketsBySla');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        $result = FakeProvider::ticketsBySla(['label' => 'test']);
+        $this->assertSame('test', $result['label']);
+        $this->assertCount(2, $result['data']['series']);
+        foreach ($result['data']['series'] as $serie) {
+            $this->assertCount(count($result['data']['labels']), $serie['data']);
+        }
+    }
+
+    public function testTicketsBySlaAndCategory(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $slm       = $this->createItem(\SLM::class, ['name' => 'test dashboard tickets by sla and category']);
+        $sla       = $this->createItem(\SLA::class, [
+            'name'            => 'test dashboard sla and category',
+            'type'            => \SLM::TTR,
+            'number_time'     => 4,
+            'definition_time' => 'hour',
+            'slms_id'         => $slm->getID(),
+        ]);
+        $sla_to_own = $this->createItem(\SLA::class, [
+            'name'            => 'test dashboard sla and category to own',
+            'type'            => \SLM::TTO,
+            'number_time'     => 4,
+            'definition_time' => 'hour',
+            'slms_id'         => $slm->getID(),
+        ]);
+        $parent_category = $this->createItem(\ITILCategory::class, ['name' => 'test sla parent']);
+        $categories      = [
+            'child' => $this->createItem(\ITILCategory::class, [
+                'name'              => 'test sla child',
+                'itilcategories_id' => $parent_category->getID(),
+            ])->getID(),
+            'other' => $this->createItem(\ITILCategory::class, ['name' => 'test sla other'])->getID(),
+            'none'  => 0,
+        ];
+
+        $tickets_ids = [];
+        // Dates far in the past so that no other ticket of the test database is counted
+        foreach (
+            [
+                'child on time'           => ['child', true, \Ticket::SOLVED, '2010-01-06 10:00:00', '2010-01-05 12:00:00'],
+                'child on time midnight'  => ['child', true, \Ticket::CLOSED, '2010-01-06 10:00:00', '2010-01-05 12:00:00', '2010-01-01 00:00:00'],
+                'child late'              => ['child', true, \Ticket::SOLVED, '2010-01-05 11:00:00', '2010-01-05 12:00:00'],
+                'child not solved'        => ['child', true, \Ticket::ASSIGNED, '2010-01-05 11:00:00', null],
+                'child without SLA'       => ['child', false, \Ticket::SOLVED, null, '2010-01-05 12:00:00'],
+                // Only its time to own SLA is filtered, it is not solved
+                'child to own not solved' => ['child', true, \Ticket::ASSIGNED, '2010-01-05 11:00:00', null, '2010-01-05 10:00:00', true],
+                'child to own on time'    => ['child', true, \Ticket::SOLVED, '2010-01-06 10:00:00', '2010-01-05 12:00:00', '2010-01-05 10:00:00', true],
+                'other on time'           => ['other', true, \Ticket::SOLVED, '2010-01-06 10:00:00', '2010-01-05 12:00:00'],
+                'other late 1'            => ['other', true, \Ticket::SOLVED, '2010-01-05 11:00:00', '2010-01-05 12:00:00'],
+                'other late 2'            => ['other', true, \Ticket::CLOSED, '2010-01-05 11:00:00', '2010-01-05 12:00:00'],
+                'other late 3'            => ['other', true, \Ticket::CLOSED, '2010-01-05 11:00:00', '2010-01-05 12:00:00'],
+                'none late'               => ['none', true, \Ticket::SOLVED, '2010-01-05 11:00:00', '2010-01-05 12:00:00'],
+            ] as $name => $values
+        ) {
+            [$category, $with_sla, $status, $time_to_resolve, $solvedate] = $values;
+            $ticket = $this->createItem(\Ticket::class, [
+                'name'        => "test dashboard tickets by sla and category $name",
+                'content'     => 'blablabla',
+                'entities_id' => $entity_id,
+            ]);
+            $DB->update(\Ticket::getTable(), [
+                'date'              => $values[5] ?? '2010-01-05 10:00:00',
+                'itilcategories_id' => $categories[$category],
+                'status'            => $status,
+                'slas_id_ttr'       => $with_sla ? $sla->getID() : 0,
+                'slas_id_tto'       => ($values[6] ?? false) ? $sla_to_own->getID() : 0,
+                'time_to_resolve'   => $time_to_resolve,
+                'solvedate'         => $solvedate,
+            ], ['id' => $ticket->getID()]);
+            $tickets_ids[$name] = $ticket->getID();
+        }
+
+        $dates_filter = [DatesFilter::getId() => ['2010-01-01', '2010-01-31']];
+        $get_values   = static function (array $result): array {
+            $values = [];
+            foreach ($result['data']['series'] as $serie) {
+                $values[$serie['name']] = array_column($serie['data'], 'value');
+            }
+            return $values;
+        };
+        $search_count = static function (string $url): int {
+            parse_str((string) parse_url($url, PHP_URL_QUERY), $search_params);
+            $search_data = \Search::getDatas(\Ticket::class, \Search::manageParams(\Ticket::class, $search_params));
+            return $search_data['data']['totalcount'];
+        };
+
+        // Only solved and closed tickets with a SLA are counted, the top categories are the last ones
+        $result = Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter]);
+        $this->assertSame(['None', 'test sla parent > test sla child', 'test sla other'], $result['data']['labels']);
+        // Both series are always returned, in a fixed order, so colors stay consistent
+        $this->assertSame(['On time' => [0, 3, 1], 'Late' => [1, 1, 3]], $get_values($result));
+
+        // The search of a bar finds the tickets counted
+        foreach (
+            [
+                [0, 1, 3], // child on time, including the ticket created at the first second of the dates filter
+                [1, 2, 3], // other late
+                [1, 0, 1], // late without category
+            ] as [$serie_index, $label_index, $expected]
+        ) {
+            $url = $result['data']['series'][$serie_index]['data'][$label_index]['url'];
+            $this->assertSame($expected, $search_count($url), $url);
+        }
+
+        // The status filter is intersected with the solved statuses
+        $closed = Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter + [TicketStatusFilter::getId() => \Ticket::CLOSED]]);
+        $this->assertSame(['test sla parent > test sla child', 'test sla other'], $closed['data']['labels']);
+        $this->assertSame(['On time' => [1, 0], 'Late' => [0, 2]], $get_values($closed));
+        $this->assertTrue(Provider::ticketsBySlaAndCategory([
+            'apply_filters' => $dates_filter + [TicketStatusFilter::getId() => \Ticket::ASSIGNED],
+        ])['data']['nodata'] ?? false);
+
+        // The category filter includes the sub categories
+        $filtered = Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter + [ItilCategoryFilter::getId() => $parent_category->getID()]]);
+        $this->assertSame(['test sla parent > test sla child'], $filtered['data']['labels']);
+        $this->assertSame(['On time' => [3], 'Late' => [1]], $get_values($filtered));
+
+        // The SLA filter matches the time to own SLA, searched as "time to own OR time to resolve",
+        // which must not bypass the other criteria of the bar
+        $filtered = Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter + [SlaFilter::getId() => $sla_to_own->getID()]]);
+        $this->assertSame(['On time' => [1], 'Late' => [0]], $get_values($filtered));
+        $this->assertSame(1, $search_count($filtered['data']['series'][0]['data'][0]['url']), 'the not solved ticket with the SLA to own must not be found');
+
+        // Without any ticket right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname]           = 0;
+        $_SESSION['glpiactiveprofile'][TicketValidation::$rightname] = 0;
+        $this->assertTrue(Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The update right alone doesn't allow to see tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = UPDATE;
+        $this->assertTrue(Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The new tickets right alone only allows to see new tickets, which are not solved
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READNEWTICKET;
+        $this->assertTrue(Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The "my tickets" right only allows to see the tickets the user is actor of
+        $hidden_id = $tickets_ids['none late'];
+        $DB->update(\Ticket::getTable(), ['users_id_recipient' => 0], ['id' => $hidden_id]);
+        $DB->delete(\Ticket_User::getTable(), ['tickets_id' => $hidden_id]);
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READMY;
+        $mine = Provider::ticketsBySlaAndCategory(['apply_filters' => $dates_filter]);
+        $this->assertSame(['test sla parent > test sla child', 'test sla other'], $mine['data']['labels'], 'ticket of another user must not be counted');
+    }
+
+    public function testFakeTicketsBySlaAndCategory(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'ticketsBySlaAndCategory');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        $result = FakeProvider::ticketsBySlaAndCategory(['label' => 'test']);
+        $this->assertSame('test', $result['label']);
+        $this->assertCount(2, $result['data']['series']);
+        foreach ($result['data']['series'] as $serie) {
+            $this->assertCount(count($result['data']['labels']), $serie['data']);
+        }
+    }
+
     public static function itemProvider()
     {
         return [
@@ -768,6 +1065,87 @@ class ProviderTest extends DbTestCase
     }
 
 
+    public function testTicketCardsVisibility(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $category  = $this->createItem(\ITILCategory::class, ['name' => 'test dashboard tickets visibility']);
+        foreach ([\Ticket::INCOMING, \Ticket::ASSIGNED] as $status) {
+            $ticket = $this->createItem(\Ticket::class, [
+                'name'              => "test dashboard tickets visibility $status",
+                'content'           => 'blablabla',
+                'entities_id'       => $entity_id,
+                'itilcategories_id' => $category->getID(),
+            ]);
+            $DB->update(\Ticket::getTable(), [
+                'date'   => '2011-06-15 10:00:00',
+                'status' => $status,
+            ], ['id' => $ticket->getID()]);
+        }
+
+        // The category filter restricts the cards to the tickets of this test
+        $params = ['apply_filters' => [
+            ItilCategoryFilter::getId() => $category->getID(),
+            DatesFilter::getId()        => ['2011-06-01', '2011-06-30'],
+        ]];
+        $sum_numbers = static fn(array $data): int => array_sum(array_column($data, 'number'));
+        $sum_series  = static fn(array $data): int => array_sum(array_map(
+            static fn(array $serie): int => array_sum(array_map(
+                static fn(mixed $value): int => (int) (is_array($value) ? $value['value'] : $value),
+                $serie['data']
+            )),
+            $data['series']
+        ));
+        // Number of tickets counted by each card, null when the card has no data
+        $cards = [
+            'ticketsByStatus'                  => static fn(): array => Provider::ticketsByStatus($params)['data'],
+            'ticketsByCategoryTree'            => static fn(): array => Provider::ticketsByCategoryTree($params)['data'],
+            'ticketsByRequesterLocation'       => static fn(): array => Provider::ticketsByRequesterLocation($params)['data'],
+            'openedTicketsByCategoryAndStatus' => static fn(): array => Provider::openedTicketsByCategoryAndStatus($params)['data'],
+            'ticketsBacklog'                   => static function () use ($params): array {
+                $data = Provider::ticketsBacklog('month', $params)['data'];
+                // Only the opened tickets serie, the other ones count the same tickets again
+                if (isset($data['series'][0])) {
+                    $data['series'] = [$data['series'][0]];
+                }
+                return $data;
+            },
+        ];
+        $count = static function (string $card) use ($cards, $sum_numbers, $sum_series): ?int {
+            $data = $cards[$card]();
+            if ($data['nodata'] ?? false) {
+                return null;
+            }
+            return isset($data['series']) ? $sum_series($data) : $sum_numbers($data);
+        };
+
+        foreach (array_keys($cards) as $card) {
+            $this->assertSame(2, $count($card), "$card: both tickets are visible with all rights");
+        }
+
+        $_SESSION['glpiactiveprofile'][TicketValidation::$rightname] = 0;
+
+        // The update right alone doesn't allow to see tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = UPDATE;
+        foreach (array_keys($cards) as $card) {
+            $this->assertNull($count($card), "$card: no ticket is visible with the update right only");
+        }
+
+        // The new tickets right alone only allows to see new tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READNEWTICKET;
+        foreach (array_keys($cards) as $card) {
+            $this->assertSame(1, $count($card), "$card: only the new ticket is visible with the new tickets right only");
+        }
+
+        // Without any ticket right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = 0;
+        foreach (array_keys($cards) as $card) {
+            $this->assertNull($count($card), "$card: no ticket is visible without ticket right");
+        }
+    }
+
     public function testTicketsByStatus()
     {
         $this->login();
@@ -803,6 +1181,86 @@ class ProviderTest extends DbTestCase
         }
 
         $this->assertGreaterThan(0, $nb_items);
+    }
+
+    public function testTicketsOpenedAndClosed(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $category  = $this->createItem(\ITILCategory::class, ['name' => 'test dashboard tickets opened and closed']);
+        foreach (
+            [
+                // the first second of the dates filter is included
+                [\Ticket::INCOMING, '2011-06-01 00:00:00', 0],
+                [\Ticket::ASSIGNED, '2011-06-10 10:00:00', 0],
+                [\Ticket::WAITING, '2011-06-30 23:59:59', 0],
+                [\Ticket::SOLVED, '2011-06-15 10:00:00', 0],
+                [\Ticket::CLOSED, '2011-06-15 10:00:00', 0],
+                // outside the dates filter
+                [\Ticket::CLOSED, '2011-07-01 00:00:00', 0],
+                // deleted
+                [\Ticket::INCOMING, '2011-06-15 10:00:00', 1],
+            ] as $index => [$status, $date, $is_deleted]
+        ) {
+            $ticket = $this->createItem(\Ticket::class, [
+                'name'              => "test dashboard tickets opened and closed $index",
+                'content'           => 'blablabla',
+                'entities_id'       => $entity_id,
+                'itilcategories_id' => $category->getID(),
+            ]);
+            $DB->update(\Ticket::getTable(), [
+                'date'       => $date,
+                'status'     => $status,
+                'is_deleted' => $is_deleted,
+            ], ['id' => $ticket->getID()]);
+        }
+
+        $params = ['apply_filters' => [
+            ItilCategoryFilter::getId() => $category->getID(),
+            DatesFilter::getId()        => ['2011-06-01', '2011-06-30'],
+        ]];
+        $get_numbers = static fn(array $result): array => array_column($result['data'], 'number', 'label');
+
+        $result = Provider::ticketsOpenedAndClosed($params);
+        $this->assertSame(['Not solved' => 3, 'Solved + Closed' => 2], $get_numbers($result));
+
+        // The search of a slice finds the tickets counted
+        foreach ($result['data'] as $slice) {
+            parse_str((string) parse_url($slice['url'], PHP_URL_QUERY), $search_params);
+            $search_data = \Search::getDatas(\Ticket::class, \Search::manageParams(\Ticket::class, $search_params));
+            $this->assertSame($slice['number'], $search_data['data']['totalcount'], $slice['url']);
+        }
+
+        // Both slices are kept when one of them is empty
+        $solved = Provider::ticketsOpenedAndClosed(['apply_filters' => $params['apply_filters'] + [
+            TicketStatusFilter::getId() => \Ticket::SOLVED,
+        ]]);
+        $this->assertSame(['Not solved' => 0, 'Solved + Closed' => 1], $get_numbers($solved));
+
+        // No ticket in the period
+        $this->assertTrue(Provider::ticketsOpenedAndClosed(['apply_filters' => [
+            ItilCategoryFilter::getId() => $category->getID(),
+            DatesFilter::getId()        => ['2012-01-01', '2012-01-31'],
+        ]])['data']['nodata'] ?? false);
+
+        $_SESSION['glpiactiveprofile'][TicketValidation::$rightname] = 0;
+
+        // The new tickets right alone only allows to see new tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READNEWTICKET;
+        $this->assertSame(
+            ['Not solved' => 1, 'Solved + Closed' => 0],
+            $get_numbers(Provider::ticketsOpenedAndClosed($params))
+        );
+
+        // The update right alone doesn't allow to see tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = UPDATE;
+        $this->assertTrue(Provider::ticketsOpenedAndClosed($params)['data']['nodata'] ?? false);
+
+        // Without any ticket right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = 0;
+        $this->assertTrue(Provider::ticketsOpenedAndClosed($params)['data']['nodata'] ?? false);
     }
     public function testTicketsOpened()
     {
@@ -1058,6 +1516,169 @@ class ProviderTest extends DbTestCase
         }
     }
 
+    public function testTicketsActionTimeVsSolveDelay(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id   = $this->getTestRootEntity(true);
+        $tickets_ids = [];
+        $group_a     = $this->createItem(\Group::class, ['name' => 'test actiontime group A', 'entities_id' => $entity_id]);
+        $group_b     = $this->createItem(\Group::class, ['name' => 'test actiontime group B', 'entities_id' => $entity_id]);
+
+        // Dates far in the past so that no other ticket of the test database is counted
+        foreach (
+            [
+                ['75% in week 1', '2010-01-05 10:00:00', 3600, [1800, 900], [$group_a, $group_b]],
+                ['50% in week 1', '2010-01-06 10:00:00', 7200, [3600], [$group_a]],
+                ['no task in week 2', '2010-01-12 10:00:00', 3600, [], [$group_a]],
+                ['not solved in week 2', '2010-01-13 10:00:00', 0, [1800], [$group_a]],
+                ['25% in week 3', '2010-01-19 10:00:00', 1000, [250, 0], [$group_b]],
+            ] as [$name, $date, $solve_delay, $actiontimes, $groups]
+        ) {
+            $ticket = $this->createItem(\Ticket::class, [
+                'name'        => "test dashboard actiontime $name",
+                'content'     => 'blablabla',
+                'entities_id' => $entity_id,
+            ]);
+            foreach ($actiontimes as $actiontime) {
+                $this->createItem(\TicketTask::class, [
+                    'tickets_id' => $ticket->getID(),
+                    'content'    => 'task',
+                    'actiontime' => $actiontime,
+                ]);
+            }
+            foreach ($groups as $group) {
+                $this->createItem(\Group_Ticket::class, [
+                    'tickets_id' => $ticket->getID(),
+                    'groups_id'  => $group->getID(),
+                    'type'       => \CommonITILActor::REQUESTER,
+                ]);
+            }
+            $DB->update(\Ticket::getTable(), [
+                'date'             => $date,
+                'status'           => $solve_delay > 0 ? \Ticket::SOLVED : \Ticket::INCOMING,
+                'solve_delay_stat' => $solve_delay,
+            ], ['id' => $ticket->getID()]);
+            $tickets_ids[$name] = $ticket->getID();
+        }
+
+        $week_filters = [DatesFilter::getId() => ['2010-01-06', '2010-01-20']];
+
+        $weeks = Provider::ticketsActionTimeVsSolveDelay('week', ['apply_filters' => $week_filters]);
+        $this->assertSame(['2010-W01', '2010-W02', '2010-W03'], $weeks['data']['labels']);
+        $this->assertCount(1, $weeks['data']['series']);
+        // Tickets without any task or not solved are ignored
+        $this->assertSame([62.5, 0.0, 25.0], $weeks['data']['series'][0]['data']);
+
+        $months = Provider::ticketsActionTimeVsSolveDelay('month', [
+            'apply_filters' => [DatesFilter::getId() => ['2010-01-01', '2010-01-31']],
+        ]);
+        $this->assertSame(['2010-01'], $months['data']['labels']);
+        $this->assertSame([50.0], $months['data']['series'][0]['data']);
+
+        // A ticket matching several filter values is counted once, and its tasks are not counted several times
+        $filtered = Provider::ticketsActionTimeVsSolveDelay('week', [
+            'apply_filters' => $week_filters + [GroupRequesterFilter::getId() => [$group_a->getID(), $group_b->getID()]],
+        ]);
+        $this->assertSame([62.5, 0.0, 25.0], $filtered['data']['series'][0]['data']);
+
+        $filtered = Provider::ticketsActionTimeVsSolveDelay('week', [
+            'apply_filters' => $week_filters + [GroupRequesterFilter::getId() => [$group_b->getID()]],
+        ]);
+        $this->assertSame([75.0, 0.0, 25.0], $filtered['data']['series'][0]['data']);
+
+        // A long range with a short period is limited to the last periods
+        $long_range = Provider::ticketsActionTimeVsSolveDelay('day', [
+            'apply_filters' => [DatesFilter::getId() => ['2008-01-01', '2010-12-31']],
+        ]);
+        $this->assertCount(366, $long_range['data']['labels']);
+        $this->assertSame('2010-12-31', end($long_range['data']['labels']));
+
+        // Only the tasks the user can see are summed: 4 tasks of 15 minutes on a ticket solved in 1 hour
+        $self_id     = \Session::getLoginUserID();
+        $other_id    = getItemByTypeName(User::class, 'tech', true);
+        $tech_group  = $this->createItem(\Group::class, ['name' => 'test actiontime tech group', 'entities_id' => $entity_id]);
+        $task_ticket = $this->createItem(\Ticket::class, [
+            'name'        => 'test dashboard actiontime private tasks',
+            'content'     => 'blablabla',
+            'entities_id' => $entity_id,
+        ]);
+        foreach (
+            [
+                'public task of another user'      => [0, $other_id, 0],
+                'private task of another user'     => [1, $other_id, 0],
+                'private task assigned to me'      => [1, $self_id, 0],
+                'private task assigned to my group' => [1, $other_id, $tech_group->getID()],
+            ] as $content => [$is_private, $users_id_tech, $groups_id_tech]
+        ) {
+            $task = $this->createItem(\TicketTask::class, [
+                'tickets_id' => $task_ticket->getID(),
+                'content'    => $content,
+                'actiontime' => 900,
+                'is_private' => $is_private,
+            ]);
+            $DB->update(\TicketTask::getTable(), [
+                'users_id'       => $other_id,
+                'users_id_tech'  => $users_id_tech,
+                'groups_id_tech' => $groups_id_tech,
+            ], ['id' => $task->getID()]);
+        }
+        $DB->update(\Ticket::getTable(), [
+            'date'             => '2011-03-01 10:00:00',
+            'status'           => \Ticket::SOLVED,
+            'solve_delay_stat' => 3600,
+        ], ['id' => $task_ticket->getID()]);
+        $month_filters = ['apply_filters' => [DatesFilter::getId() => ['2011-03-01', '2011-03-31']]];
+        $get_percent   = static fn(): array => Provider::ticketsActionTimeVsSolveDelay('month', $month_filters)['data']['series'][0]['data'];
+
+        $this->assertSame([100.0], $get_percent(), 'all tasks are visible with the right to see private tasks');
+        $_SESSION['glpiactiveprofile'][\TicketTask::$rightname] = \TicketTask::SEEPUBLIC;
+        $_SESSION['glpigroups']                                 = [];
+        $this->assertSame([50.0], $get_percent(), 'private task of another user must not be summed');
+        $_SESSION['glpigroups'] = [$tech_group->getID()];
+        $this->assertSame([75.0], $get_percent(), 'private task assigned to a group of the user is visible');
+        $_SESSION['glpiactiveprofile'][\TicketTask::$rightname] = 0;
+        $_SESSION['glpigroups']                                 = [];
+        $this->assertSame([25.0], $get_percent(), 'without task right, only the tasks assigned to the user are visible');
+
+        // Without any ticket right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname]           = 0;
+        $_SESSION['glpiactiveprofile'][TicketValidation::$rightname] = 0;
+        $this->assertTrue(Provider::ticketsActionTimeVsSolveDelay('week', ['apply_filters' => $week_filters])['data']['nodata'] ?? false);
+
+        // The update right alone doesn't allow to see tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = UPDATE;
+        $this->assertTrue(Provider::ticketsActionTimeVsSolveDelay('week', ['apply_filters' => $week_filters])['data']['nodata'] ?? false);
+
+        // The new tickets right alone only allows to see new tickets, which are not solved
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READNEWTICKET;
+        $new_only = Provider::ticketsActionTimeVsSolveDelay('week', ['apply_filters' => $week_filters]);
+        $this->assertSame([0.0, 0.0, 0.0], $new_only['data']['series'][0]['data'], 'solved tickets must not be visible');
+
+        // The "my tickets" right only allows to see the tickets the user is actor of
+        $hidden_id = $tickets_ids['75% in week 1'];
+        $DB->update(\Ticket::getTable(), ['users_id_recipient' => 0], ['id' => $hidden_id]);
+        $DB->delete(\Ticket_User::getTable(), ['tickets_id' => $hidden_id]);
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READMY;
+        $mine = Provider::ticketsActionTimeVsSolveDelay('week', ['apply_filters' => $week_filters]);
+        $this->assertSame([50.0, 0.0, 25.0], $mine['data']['series'][0]['data'], 'ticket of another user must not be counted');
+    }
+
+    public function testFakeTicketsActionTimeVsSolveDelay(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'ticketsActionTimeVsSolveDelay');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        foreach (['day', 'week', 'month', 'year'] as $period) {
+            $result = FakeProvider::ticketsActionTimeVsSolveDelay($period, ['label' => 'test']);
+            $this->assertSame('test', $result['label']);
+            $this->assertCount(1, $result['data']['series']);
+            $this->assertCount(count($result['data']['labels']), $result['data']['series'][0]['data']);
+        }
+    }
+
 
     public function testTopTicketsCategories()
     {
@@ -1208,6 +1829,321 @@ class ProviderTest extends DbTestCase
         }
 
         $this->assertGreaterThan(0, $nb_items);
+    }
+
+    public function testComputersByMonitorsNumber(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $state     = $this->createItem(\State::class, ['name' => 'test dashboard monitors state']);
+        $computers = [];
+
+        foreach (
+            [
+                // computer => [monitors, deleted monitors, template monitors, is the computer deleted]
+                'no monitor'          => [0, 0, 0, false],
+                'one monitor'         => [1, 0, 0, false],
+                'one other monitor'   => [1, 1, 1, false],
+                'three monitors'      => [3, 0, 0, false],
+                'deleted computer'    => [2, 0, 0, true],
+            ] as $name => [$nb_monitors, $nb_deleted, $nb_templates, $is_deleted]
+        ) {
+            $computer = $this->createItem(\Computer::class, [
+                'name'        => "test dashboard computer $name",
+                'entities_id' => $entity_id,
+                'states_id'   => $state->getID(),
+                'is_deleted'  => (int) $is_deleted,
+            ]);
+            $computers[$name] = $computer;
+            for ($i = 0; $i < $nb_monitors + $nb_deleted + $nb_templates; $i++) {
+                $monitor = $this->createItem(\Monitor::class, [
+                    'name'        => "test dashboard monitor $name $i",
+                    'entities_id' => $entity_id,
+                    'is_deleted'  => (int) ($i >= $nb_monitors && $i < $nb_monitors + $nb_deleted),
+                    'is_template' => (int) ($i >= $nb_monitors + $nb_deleted),
+                ]);
+                $this->assertTrue($DB->insert(Asset_PeripheralAsset::getTable(), [
+                    'itemtype_asset'      => \Computer::class,
+                    'items_id_asset'      => $computer->getID(),
+                    'itemtype_peripheral' => \Monitor::class,
+                    'items_id_peripheral' => $monitor->getID(),
+                ]));
+            }
+        }
+
+        // A deleted connection to an active monitor is not counted
+        $monitor = $this->createItem(\Monitor::class, [
+            'name'        => 'test dashboard monitor deleted connection',
+            'entities_id' => $entity_id,
+        ]);
+        $this->assertTrue($DB->insert(Asset_PeripheralAsset::getTable(), [
+            'itemtype_asset'      => \Computer::class,
+            'items_id_asset'      => $computers['one monitor']->getID(),
+            'itemtype_peripheral' => \Monitor::class,
+            'items_id_peripheral' => $monitor->getID(),
+            'is_deleted'          => 1,
+        ]));
+
+        // The state filter restricts the computers to the ones of this test
+        $params     = ['apply_filters' => [StateFilter::getId() => [$state->getID()]]];
+        $get_values = static fn(array $result): array => array_combine(
+            array_column($result['data'], 'label'),
+            array_column($result['data'], 'number')
+        );
+
+        // Deleted and template monitors, deleted connections and deleted computers are not counted, the missing numbers are filled
+        $result = Provider::computersByMonitorsNumber($params);
+        $this->assertSame([
+            '0 monitors' => 1,
+            '1 monitor'  => 2,
+            '2 monitors' => 0,
+            '3 monitors' => 1,
+        ], $get_values($result));
+        foreach ($result['data'] as $entry) {
+            $this->assertSame('', $entry['url']);
+        }
+
+        // Without the computer or the monitor right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Monitor::$rightname] = 0;
+        $this->assertTrue(Provider::computersByMonitorsNumber($params)['data']['nodata'] ?? false);
+        $_SESSION['glpiactiveprofile'][\Monitor::$rightname]  = READ;
+        $_SESSION['glpiactiveprofile'][\Computer::$rightname] = 0;
+        $this->assertTrue(Provider::computersByMonitorsNumber($params)['data']['nodata'] ?? false);
+    }
+
+    public function testFakeComputersByMonitorsNumber(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'computersByMonitorsNumber');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        $result = FakeProvider::computersByMonitorsNumber(['label' => 'test']);
+        $this->assertSame('test', $result['label']);
+        $this->assertNotEmpty($result['data']);
+        foreach ($result['data'] as $entry) {
+            $this->assertArrayHasKey('url', $entry);
+        }
+    }
+
+    public function testComputersByAgentVersion(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id  = $this->getTestRootEntity(true);
+        $state      = $this->createItem(\State::class, ['name' => 'test dashboard agent version state']);
+        $agent_type = new \AgentType();
+        $this->assertTrue($agent_type->getFromDBByCrit(['name' => 'Core']));
+
+        $add_agent = static function (string $itemtype, int $items_id, string $version) use ($DB, $entity_id, $agent_type): void {
+            static $nb = 0;
+            $nb++;
+            $DB->insert(\Agent::getTable(), [
+                'deviceid'      => "test-dashboard-agent-version-$nb",
+                'name'          => "test dashboard agent $nb",
+                'entities_id'   => $entity_id,
+                'agenttypes_id' => $agent_type->getID(),
+                'itemtype'      => $itemtype,
+                'items_id'      => $items_id,
+                'version'       => $version,
+            ]);
+        };
+
+        $computers = [];
+        foreach (
+            [
+                // computer => [agent version, null without agent, is the computer deleted]
+                'recent 1'     => ['1.11', false],
+                'recent 2'     => ['1.11', false],
+                'older'        => ['1.10', false],
+                'oldest'       => ['1.9', false],
+                'no version'   => ['', false],
+                'no agent'     => [null, false],
+                'deleted'      => ['1.11', true],
+            ] as $name => [$version, $is_deleted]
+        ) {
+            $computer = $this->createItem(\Computer::class, [
+                'name'        => "test dashboard computer agent $name",
+                'entities_id' => $entity_id,
+                'states_id'   => $state->getID(),
+                'is_deleted'  => (int) $is_deleted,
+            ]);
+            $computers[$name] = $computer->getID();
+            if ($version !== null) {
+                $add_agent(\Computer::class, $computer->getID(), $version);
+            }
+        }
+        // An agent of another kind of asset with the same id must not be counted
+        $add_agent(\Phone::class, $computers['older'], '1.9');
+
+        // The state filter restricts the computers to the ones of this test
+        $params     = ['apply_filters' => [StateFilter::getId() => [$state->getID()]]];
+        $get_values = static fn(array $result): array => array_combine(
+            array_column($result['data'], 'label'),
+            array_column($result['data'], 'number')
+        );
+
+        // Biggest counts first, then the most recent versions first
+        $result = Provider::computersByAgentVersion($params);
+        $this->assertSame(['1.11' => 2, '1.10' => 1, '1.9' => 1, 'None' => 1], $get_values($result));
+
+        // The search of an entry finds the computers counted
+        foreach ($result['data'] as $entry) {
+            parse_str((string) parse_url($entry['url'], PHP_URL_QUERY), $search_params);
+            $search_data = \Search::getDatas(\Computer::class, \Search::manageParams(\Computer::class, $search_params));
+            $this->assertSame($entry['number'], $search_data['data']['totalcount'], $entry['label']);
+        }
+
+        // Without the computer or the agent right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Agent::$rightname] = 0;
+        $this->assertTrue(Provider::computersByAgentVersion($params)['data']['nodata'] ?? false);
+        $_SESSION['glpiactiveprofile'][\Agent::$rightname]    = READ;
+        $_SESSION['glpiactiveprofile'][\Computer::$rightname] = 0;
+        $this->assertTrue(Provider::computersByAgentVersion($params)['data']['nodata'] ?? false);
+    }
+
+    public function testFakeComputersByAgentVersion(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'computersByAgentVersion');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        $result = FakeProvider::computersByAgentVersion(['label' => 'test']);
+        $this->assertSame('test', $result['label']);
+        $this->assertNotEmpty($result['data']);
+        foreach ($result['data'] as $entry) {
+            $this->assertArrayHasKey('url', $entry);
+        }
+    }
+
+    public function testComputersByOperatingSystemVersion(): void
+    {
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $state     = $this->createItem(\State::class, ['name' => 'test dashboard os version state']);
+
+        $oses     = [];
+        $versions = [];
+        foreach (
+            [
+                // os => [version => [number of computers, deleted computers, template computers, computers with the state]]
+                'test dashboard Microsoft Windows 11' => ['23H2' => [2, 1, 1, 1], '24H2' => [1, 0, 0, 0], '' => [1, 0, 0, 0]],
+                'test dashboard Ubuntu'               => ['24.04' => [2, 0, 0, 0]],
+                'test dashboard Debian GNU/Linux'     => ['12' => [1, 0, 0, 1]],
+                'test dashboard macOS'                => ['14.5' => [1, 0, 0, 0], '14.6' => [2, 0, 0, 0], '15.1' => [1, 0, 0, 0]],
+                'test dashboard Mac OS X'             => ['10.15.7' => [1, 0, 0, 0]],
+            ] as $os_name => $os_versions
+        ) {
+            $oses[$os_name] = $this->createItem(\OperatingSystem::class, ['name' => $os_name])->getID();
+            foreach ($os_versions as $version_name => [$nb, $nb_deleted, $nb_templates, $nb_with_state]) {
+                $version_id = 0;
+                if ($version_name !== '') {
+                    $versions[$version_name] ??= $this->createItem(\OperatingSystemVersion::class, ['name' => $version_name])->getID();
+                    $version_id = $versions[$version_name];
+                }
+                for ($i = 0; $i < $nb + $nb_deleted + $nb_templates; $i++) {
+                    $computer = $this->createItem(\Computer::class, [
+                        'name'        => "test dashboard computer $os_name $version_name $i",
+                        'entities_id' => $entity_id,
+                        'is_deleted'  => (int) ($i >= $nb && $i < $nb + $nb_deleted),
+                        'is_template' => (int) ($i >= $nb + $nb_deleted),
+                        'states_id'   => $i < $nb_with_state ? $state->getID() : 0,
+                    ]);
+                    $this->createItem(\Item_OperatingSystem::class, [
+                        'itemtype'                   => \Computer::class,
+                        'items_id'                   => $computer->getID(),
+                        'operatingsystems_id'        => $oses[$os_name],
+                        'operatingsystemversions_id' => $version_id,
+                    ]);
+                }
+            }
+        }
+
+        // Only the operating systems of this test are checked, other computers may exist in the test database
+        $get_values = static function (array $result): array {
+            $values = [];
+            foreach ($result['data'] as $entry) {
+                if (str_contains($entry['label'], 'test dashboard')) {
+                    $values[$entry['label']] = $entry['number'];
+                }
+            }
+            return $values;
+        };
+        $search_count = static function (string $url): int {
+            parse_str((string) parse_url($url, PHP_URL_QUERY), $search_params);
+            $search_data = \Search::getDatas(\Computer::class, \Search::manageParams(\Computer::class, $search_params));
+            return $search_data['data']['totalcount'];
+        };
+
+        // Deleted and template computers are not counted, the biggest counts first
+        $windows = Provider::computersByOperatingSystemVersion('windows', 'version');
+        $this->assertSame([
+            'test dashboard Microsoft Windows 11 23H2'   => 2,
+            'test dashboard Microsoft Windows 11 (None)' => 1,
+            'test dashboard Microsoft Windows 11 24H2'   => 1,
+        ], $get_values($windows));
+        foreach ($windows['data'] as $entry) {
+            if (str_contains($entry['label'], 'test dashboard')) {
+                $this->assertSame($entry['number'], $search_count($entry['url']), $entry['label']);
+            }
+        }
+
+        $this->assertSame([
+            'test dashboard Ubuntu 24.04'        => 2,
+            'test dashboard Debian GNU/Linux 12' => 1,
+        ], $get_values(Provider::computersByOperatingSystemVersion('linux', 'version')));
+
+        $distributions = Provider::computersByOperatingSystemVersion('linux', 'name');
+        $this->assertSame([
+            'test dashboard Ubuntu'           => 2,
+            'test dashboard Debian GNU/Linux' => 1,
+        ], $get_values($distributions));
+
+        // macOS 10.x major versions are "10.x", the next ones are "11", "12"...
+        $majors = Provider::computersByOperatingSystemVersion('macos', 'major');
+        $this->assertSame([
+            'test dashboard macOS 14'          => 3,
+            'test dashboard Mac OS X 10.15'    => 1,
+            'test dashboard macOS 15'          => 1,
+        ], $get_values($majors));
+        foreach (array_merge($distributions['data'], $majors['data']) as $entry) {
+            if (str_contains($entry['label'], 'test dashboard')) {
+                $this->assertSame($entry['number'], $search_count($entry['url']), $entry['label']);
+            }
+        }
+
+        // The dashboard filters are applied
+        $filtered = Provider::computersByOperatingSystemVersion('windows', 'version', [
+            'apply_filters' => [StateFilter::getId() => [$state->getID()]],
+        ]);
+        $this->assertSame(['test dashboard Microsoft Windows 11 23H2' => 1], $get_values($filtered));
+        $this->assertSame(1, $search_count($filtered['data'][0]['url']));
+
+        // Unknown family or grouping
+        $this->assertTrue(Provider::computersByOperatingSystemVersion('beos', 'version')['data']['nodata'] ?? false);
+        $this->assertTrue(Provider::computersByOperatingSystemVersion('windows', 'kernel')['data']['nodata'] ?? false);
+
+        // Without the computer right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Computer::$rightname] = 0;
+        $this->assertTrue(Provider::computersByOperatingSystemVersion('windows', 'version')['data']['nodata'] ?? false);
+    }
+
+    public function testFakeComputersByOperatingSystemVersion(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'computersByOperatingSystemVersion');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        foreach (['windows' => 'version', 'linux' => 'name', 'macos' => 'major'] as $family => $group_by) {
+            $result = FakeProvider::computersByOperatingSystemVersion($family, $group_by, ['label' => 'test']);
+            $this->assertSame('test', $result['label']);
+            $this->assertNotEmpty($result['data']);
+            foreach ($result['data'] as $entry) {
+                $this->assertArrayHasKey('url', $entry);
+            }
+        }
     }
 
     public function testComputersByAge()
@@ -1527,6 +2463,132 @@ class ProviderTest extends DbTestCase
         $this->assertCount(count(\Ticket::getAllStatusArray()), $result['data']['series']);
         foreach ($result['data']['series'] as $serie) {
             $this->assertCount(count($result['data']['labels']), $serie['data']);
+        }
+    }
+
+    public function testTicketsByAssignedGroupChanges(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $groups    = [];
+        foreach (['A', 'B', 'C'] as $letter) {
+            $groups[$letter] = $this->createItem(\Group::class, [
+                'name'        => "test dashboard group changes $letter",
+                'entities_id' => $entity_id,
+            ]);
+        }
+
+        $tickets_ids = [];
+        // Each step adds (+) or removes (-) a group of the given actor type
+        foreach (
+            [
+                'never changed' => [['+', 'A', \CommonITILActor::ASSIGN]],
+                'changed once'  => [['+', 'A', \CommonITILActor::ASSIGN], ['-', 'A', \CommonITILActor::ASSIGN], ['+', 'B', \CommonITILActor::ASSIGN]],
+                'changed twice' => [
+                    ['+', 'A', \CommonITILActor::ASSIGN],
+                    ['+', 'B', \CommonITILActor::ASSIGN],
+                    ['+', 'C', \CommonITILActor::ASSIGN],
+                    ['+', 'A', \CommonITILActor::REQUESTER],
+                    ['+', 'B', \CommonITILActor::OBSERVER],
+                ],
+                'no assigned group' => [['+', 'A', \CommonITILActor::REQUESTER], ['+', 'B', \CommonITILActor::REQUESTER]],
+            ] as $name => $steps
+        ) {
+            $ticket = $this->createItem(\Ticket::class, [
+                'name'        => "test dashboard group changes $name",
+                'content'     => 'blablabla',
+                'entities_id' => $entity_id,
+            ]);
+            foreach ($steps as [$action, $letter, $type]) {
+                $link = [
+                    'tickets_id' => $ticket->getID(),
+                    'groups_id'  => $groups[$letter]->getID(),
+                    'type'       => $type,
+                ];
+                if ($action === '+') {
+                    $this->createItem(\Group_Ticket::class, $link);
+                } else {
+                    $group_ticket = new \Group_Ticket();
+                    $this->assertTrue($group_ticket->getFromDBByCrit($link));
+                    $this->deleteItem(\Group_Ticket::class, $group_ticket->getID());
+                }
+            }
+            // A date far in the past so that no other ticket of the test database is counted
+            $DB->update(\Ticket::getTable(), [
+                'date'   => '2010-01-05 10:00:00',
+                'status' => $name === 'changed twice' ? \Ticket::SOLVED : \Ticket::INCOMING,
+            ], ['id' => $ticket->getID()]);
+            $tickets_ids[$name] = $ticket->getID();
+        }
+
+        $dates_filter = [DatesFilter::getId() => ['2010-01-01', '2010-01-31']];
+        $get_counts   = static fn(array $result): array => array_combine(
+            array_column($result['data'], 'label'),
+            array_column($result['data'], 'number')
+        );
+
+        // Requester and observer groups are not counted, tickets without assigned group neither
+        $result = Provider::ticketsByAssignedGroupChanges(['apply_filters' => $dates_filter]);
+        $this->assertSame(['0 changes' => 1, '1 change' => 1, '2 changes' => 1], $get_counts($result));
+        foreach ($result['data'] as $data) {
+            $this->assertSame('', $data['url']);
+        }
+
+        // A ticket matching several filter values is counted once, and its history is not counted several times
+        $filtered = Provider::ticketsByAssignedGroupChanges([
+            'apply_filters' => $dates_filter + [GroupTechFilter::getId() => array_map(static fn($group) => $group->getID(), array_values($groups))],
+        ]);
+        $this->assertSame(['0 changes' => 1, '1 change' => 1, '2 changes' => 1], $get_counts($filtered));
+
+        // Missing numbers of changes are filled with zero
+        $filtered = Provider::ticketsByAssignedGroupChanges([
+            'apply_filters' => $dates_filter + [GroupTechFilter::getId() => [$groups['C']->getID()]],
+        ]);
+        $this->assertSame(['0 changes' => 0, '1 change' => 0, '2 changes' => 1], $get_counts($filtered));
+
+        // The history is not exposed without the right to read it
+        $logs_right = $_SESSION['glpiactiveprofile'][\Log::$rightname];
+        $_SESSION['glpiactiveprofile'][\Log::$rightname] = 0;
+        $this->assertTrue(Provider::ticketsByAssignedGroupChanges(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+        $_SESSION['glpiactiveprofile'][\Log::$rightname] = $logs_right;
+
+        // Without any ticket right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname]           = 0;
+        $_SESSION['glpiactiveprofile'][TicketValidation::$rightname] = 0;
+        $this->assertTrue(Provider::ticketsByAssignedGroupChanges(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The update right alone doesn't allow to see tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = UPDATE;
+        $this->assertTrue(Provider::ticketsByAssignedGroupChanges(['apply_filters' => $dates_filter])['data']['nodata'] ?? false);
+
+        // The new tickets right alone only allows to see new tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READNEWTICKET;
+        $new_only = Provider::ticketsByAssignedGroupChanges(['apply_filters' => $dates_filter]);
+        $this->assertSame(['0 changes' => 1, '1 change' => 1], $get_counts($new_only), 'solved ticket must not be visible');
+
+        // The "my tickets" right only allows to see the tickets the user is actor of
+        $hidden_id = $tickets_ids['changed once'];
+        $DB->update(\Ticket::getTable(), ['users_id_recipient' => 0], ['id' => $hidden_id]);
+        $DB->delete(\Ticket_User::getTable(), ['tickets_id' => $hidden_id]);
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READMY;
+        $mine = Provider::ticketsByAssignedGroupChanges(['apply_filters' => $dates_filter]);
+        $this->assertSame(['0 changes' => 1, '1 change' => 0, '2 changes' => 1], $get_counts($mine), 'ticket of another user must not be counted');
+    }
+
+    public function testFakeTicketsByAssignedGroupChanges(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'ticketsByAssignedGroupChanges');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        $result = FakeProvider::ticketsByAssignedGroupChanges(['label' => 'test']);
+        $this->assertSame('test', $result['label']);
+        $this->assertSame('0 changes', $result['data'][0]['label']);
+        foreach ($result['data'] as $data) {
+            $this->assertIsInt($data['number']);
+            $this->assertSame('', $data['url']);
         }
     }
 
@@ -2103,6 +3165,159 @@ class ProviderTest extends DbTestCase
             $result = FakeProvider::ticketsBacklog($period, ['label' => 'test']);
             $this->assertSame('test', $result['label']);
             $this->assertCount(4, $result['data']['series']);
+            foreach ($result['data']['series'] as $serie) {
+                $this->assertCount(count($result['data']['labels']), $serie['data']);
+            }
+        }
+    }
+
+    public function testTicketsBySlaEvolution(): void
+    {
+        global $DB;
+
+        $this->login();
+        $entity_id = $this->getTestRootEntity(true);
+        $slm       = $this->createItem(\SLM::class, ['name' => 'test dashboard sla evolution']);
+        $sla       = $this->createItem(\SLA::class, [
+            'name'            => 'test dashboard sla evolution',
+            'type'            => \SLM::TTR,
+            'number_time'     => 4,
+            'definition_time' => 'hour',
+            'slms_id'         => $slm->getID(),
+        ]);
+        $sla_to_own = $this->createItem(\SLA::class, [
+            'name'            => 'test dashboard sla evolution to own',
+            'type'            => \SLM::TTO,
+            'number_time'     => 1,
+            'definition_time' => 'hour',
+            'slms_id'         => $slm->getID(),
+        ]);
+        // Tickets having the time to own SLA
+        $with_sla_to_own = ['week 1 on time', 'week 2 not solved'];
+
+        $tickets_ids = [];
+        // Dates far in the past so that no other ticket of the test database is counted
+        foreach (
+            [
+                'week 1 on time'          => ['2010-01-05 10:00:00', true, \Ticket::SOLVED, false],
+                'week 1 late'             => ['2010-01-05 10:00:00', true, \Ticket::CLOSED, true],
+                'week 2 on time midnight' => ['2010-01-11 00:00:00', true, \Ticket::CLOSED, false],
+                'week 2 late'             => ['2010-01-12 10:00:00', true, \Ticket::SOLVED, true],
+                'week 2 late again'       => ['2010-01-13 10:00:00', true, \Ticket::SOLVED, true],
+                'week 2 without SLA'      => ['2010-01-13 10:00:00', false, \Ticket::SOLVED, true],
+                'week 2 not solved'       => ['2010-01-13 10:00:00', true, \Ticket::ASSIGNED, true],
+            ] as $name => [$date, $with_sla, $status, $is_late]
+        ) {
+            $ticket = $this->createItem(\Ticket::class, [
+                'name'        => "test dashboard sla evolution $name",
+                'content'     => 'blablabla',
+                'entities_id' => $entity_id,
+            ]);
+            $open_ts = strtotime($date);
+            $DB->update(\Ticket::getTable(), [
+                'date'            => $date,
+                'status'          => $status,
+                'slas_id_ttr'     => $with_sla ? $sla->getID() : 0,
+                'slas_id_tto'     => in_array($name, $with_sla_to_own, true) ? $sla_to_own->getID() : 0,
+                'time_to_resolve' => date('Y-m-d H:i:s', $open_ts + 4 * HOUR_TIMESTAMP),
+                'solvedate'       => $status === \Ticket::ASSIGNED ? null : date('Y-m-d H:i:s', $open_ts + ($is_late ? 5 : 3) * HOUR_TIMESTAMP),
+            ], ['id' => $ticket->getID()]);
+            $tickets_ids[$name] = $ticket->getID();
+        }
+
+        $week_filters = [DatesFilter::getId() => ['2010-01-06', '2010-01-20']];
+        $get_values   = static function (array $result): array {
+            $values = [];
+            foreach ($result['data']['series'] as $serie) {
+                $values[$serie['name']] = array_column($serie['data'], 'value');
+            }
+            return $values;
+        };
+
+        // Only solved and closed tickets with a SLA are counted, by their opening period
+        $weeks = Provider::ticketsBySlaEvolution('week', ['apply_filters' => $week_filters]);
+        $this->assertSame(['2010-W01', '2010-W02', '2010-W03'], $weeks['data']['labels']);
+        // Both series are always returned, in a fixed order, so colors stay consistent
+        $this->assertSame(['On time' => [1, 1, 0], 'Late' => [1, 2, 0]], $get_values($weeks));
+
+        $months = Provider::ticketsBySlaEvolution('month', [
+            'apply_filters' => [DatesFilter::getId() => ['2010-01-01', '2010-01-31']],
+        ]);
+        $this->assertSame(['2010-01'], $months['data']['labels']);
+        $this->assertSame(['On time' => [2], 'Late' => [3]], $get_values($months));
+
+        // The search of a period finds the tickets counted, including the one created exactly at the period start
+        foreach (
+            [
+                [0, 0, 1], // week 1 on time
+                [0, 1, 1], // week 2 on time, at midnight
+                [1, 1, 2], // week 2 late
+            ] as [$serie_index, $period_index, $expected]
+        ) {
+            $url = $weeks['data']['series'][$serie_index]['data'][$period_index]['url'];
+            parse_str((string) parse_url($url, PHP_URL_QUERY), $search_params);
+            $search_data = \Search::getDatas(\Ticket::class, \Search::manageParams(\Ticket::class, $search_params));
+            $this->assertSame($expected, $search_data['data']['totalcount'], $url);
+        }
+
+        // The status filter is intersected with the solved statuses
+        $closed = Provider::ticketsBySlaEvolution('week', [
+            'apply_filters' => $week_filters + [TicketStatusFilter::getId() => \Ticket::CLOSED],
+        ]);
+        $this->assertSame(['On time' => [0, 1, 0], 'Late' => [1, 0, 0]], $get_values($closed));
+        $this->assertTrue(Provider::ticketsBySlaEvolution('week', [
+            'apply_filters' => $week_filters + [TicketStatusFilter::getId() => \Ticket::ASSIGNED],
+        ])['data']['nodata'] ?? false);
+
+        // The SLA filter is searched as "time to own OR time to resolve", which must not bypass the other criteria of the point
+        $filtered = Provider::ticketsBySlaEvolution('week', [
+            'apply_filters' => $week_filters + [SlaFilter::getId() => $sla_to_own->getID()],
+        ]);
+        $this->assertSame(['On time' => [1, 0, 0], 'Late' => [0, 0, 0]], $get_values($filtered));
+        parse_str((string) parse_url($filtered['data']['series'][0]['data'][0]['url'], PHP_URL_QUERY), $search_params);
+        $search_data = \Search::getDatas(\Ticket::class, \Search::manageParams(\Ticket::class, $search_params));
+        $this->assertSame(1, $search_data['data']['totalcount'], 'the not solved ticket with the SLA to own must not be found');
+
+        // A long range with a short period is limited to the last periods
+        $long_range = Provider::ticketsBySlaEvolution('day', [
+            'apply_filters' => [DatesFilter::getId() => ['2008-01-01', '2010-12-31']],
+        ]);
+        $this->assertCount(366, $long_range['data']['labels']);
+        $this->assertSame('2010-12-31', end($long_range['data']['labels']));
+
+        // Without any ticket right, nothing is exposed
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname]           = 0;
+        $_SESSION['glpiactiveprofile'][TicketValidation::$rightname] = 0;
+        $this->assertTrue(Provider::ticketsBySlaEvolution('week', ['apply_filters' => $week_filters])['data']['nodata'] ?? false);
+
+        // The update right alone doesn't allow to see tickets
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = UPDATE;
+        $this->assertTrue(Provider::ticketsBySlaEvolution('week', ['apply_filters' => $week_filters])['data']['nodata'] ?? false);
+
+        // The new tickets right alone only allows to see new tickets, which are not solved
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READNEWTICKET;
+        $new_only = Provider::ticketsBySlaEvolution('week', ['apply_filters' => $week_filters]);
+        $this->assertSame(['On time' => [0, 0, 0], 'Late' => [0, 0, 0]], $get_values($new_only), 'solved tickets must not be visible');
+
+        // The "my tickets" right only allows to see the tickets the user is actor of
+        $hidden_id = $tickets_ids['week 2 late again'];
+        $DB->update(\Ticket::getTable(), ['users_id_recipient' => 0], ['id' => $hidden_id]);
+        $DB->delete(\Ticket_User::getTable(), ['tickets_id' => $hidden_id]);
+        $_SESSION['glpiactiveprofile'][\Ticket::$rightname] = \Ticket::READMY;
+        $mine = Provider::ticketsBySlaEvolution('week', ['apply_filters' => $week_filters]);
+        $this->assertSame(['On time' => [1, 1, 0], 'Late' => [1, 1, 0]], $get_values($mine), 'ticket of another user must not be counted');
+    }
+
+    public function testFakeTicketsBySlaEvolution(): void
+    {
+        // Demo mode must not run the real query
+        $method = new \ReflectionMethod(FakeProvider::class, 'ticketsBySlaEvolution');
+        $this->assertSame(FakeProvider::class, $method->getDeclaringClass()->getName());
+
+        foreach (['day', 'week', 'month', 'year'] as $period) {
+            $result = FakeProvider::ticketsBySlaEvolution($period, ['label' => 'test']);
+            $this->assertSame('test', $result['label']);
+            $this->assertCount(2, $result['data']['series']);
             foreach ($result['data']['series'] as $serie) {
                 $this->assertCount(count($result['data']['labels']), $serie['data']);
             }

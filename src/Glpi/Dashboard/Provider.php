@@ -35,6 +35,7 @@
 
 namespace Glpi\Dashboard;
 
+use Agent;
 use CommonDBTM;
 use CommonDevice;
 use CommonITILActor;
@@ -45,6 +46,7 @@ use Computer;
 use Config;
 use DBConnection;
 use ExtraVisibilityCriteria;
+use Glpi\Asset\Asset_PeripheralAsset;
 use Glpi\Dashboard\Filters\{
     AbstractGroupFilter,
     DatesFilter,
@@ -63,19 +65,25 @@ use Group;
 use Group_Ticket;
 use Item_OperatingSystem;
 use Location;
+use Log;
+use Monitor;
 use OperatingSystem;
+use OperatingSystemVersion;
 use Profile_User;
 use Safe\DateTimeImmutable;
 use Safe\Exceptions\DatetimeException;
 use Session;
+use SLA;
 use Stat;
 use Ticket;
 use Ticket_User;
+use TicketTask;
 use TicketValidation;
 use Toolbox;
 use User;
 
 use function Safe\mktime;
+use function Safe\preg_match;
 use function Safe\strtotime;
 
 /**
@@ -871,6 +879,367 @@ class Provider
         ];
     }
 
+    /**
+     * Count solved and closed tickets grouped by their SLA (time to resolve),
+     * split between the tickets solved on time and the ones solved late.
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public static function ticketsBySla(array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => "ti ti-stopwatch",
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        $no_data = [
+            'data'  => [
+                'labels' => [],
+                'series' => [],
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return $no_data;
+        }
+
+        // A dashboard status filter would be merged into the IN() list, intersect it with solved statuses instead
+        $solved_statuses  = array_merge(Ticket::getSolvedStatusArray(), Ticket::getClosedStatusArray());
+        $queried_statuses = $solved_statuses;
+        $filtered_status  = (int) ($params['apply_filters'][TicketStatusFilter::getId()] ?? 0);
+        unset($params['apply_filters'][TicketStatusFilter::getId()]);
+        if ($filtered_status > 0) {
+            $queried_statuses = array_values(array_intersect($solved_statuses, [$filtered_status]));
+        }
+        if (count($queried_statuses) === 0) {
+            return $no_data;
+        }
+
+        $ticket_table = Ticket::getTable();
+        $sla_table    = SLA::getTable();
+        // Same computation as the "Time to resolve exceeded" search option
+        $late_expression = Ticket::generateSLAOLAComputation('time_to_resolve', $ticket_table);
+        if (!$late_expression instanceof QueryExpression) {
+            return $no_data;
+        }
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        $criteria = array_merge_recursive(
+            [
+                'SELECT'     => [
+                    "$sla_table.id",
+                    "$sla_table.name",
+                    QueryFunction::if(
+                        condition: $late_expression,
+                        true_expression: new QueryExpression('1'),
+                        false_expression: new QueryExpression('0'),
+                        alias: 'is_late'
+                    ),
+                    'COUNT DISTINCT' => "$ticket_table.id AS cpt",
+                ],
+                'FROM'       => $ticket_table,
+                'INNER JOIN' => [
+                    $sla_table => [
+                        'ON' => [
+                            $sla_table    => 'id',
+                            $ticket_table => 'slas_id_ttr',
+                        ],
+                    ],
+                ],
+                'WHERE'      => [
+                    "$ticket_table.is_deleted" => 0,
+                    "$ticket_table.status"     => $queried_statuses,
+                ] + getEntitiesRestrictCriteria($ticket_table),
+                'GROUPBY'    => ["$sla_table.id", "$sla_table.name", 'is_late'],
+                'ORDER'      => ["$sla_table.name", "$sla_table.id"],
+            ],
+            $visibility_criteria,
+            self::getFiltersCriteria($ticket_table, $params['apply_filters'])
+        );
+
+        $slas   = [];
+        $counts = [];
+        foreach ($db->request($criteria) as $result) {
+            $sla_id                                   = (int) $result['id'];
+            $slas[$sla_id]                            = $result['name'];
+            $counts[$sla_id][(int) $result['is_late']] = (int) $result['cpt'];
+        }
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        if (count($slas) === 0) {
+            return $no_data;
+        }
+
+        // The dates filter search is strict on its first day, while the count includes its first second:
+        // the dates are searched below with the same bounds as the count
+        $search_filters = $params['apply_filters'];
+        $dates_value    = $search_filters[DatesFilter::getId()] ?? null;
+        unset($search_filters[DatesFilter::getId()]);
+        $search_criteria = self::getSearchFiltersCriteria($ticket_table, $search_filters)['criteria'] ?? [];
+        // Some filters are searched with OR criteria (e.g. SLA time to own OR time to resolve),
+        // they are grouped so they can't bypass the other criteria of the search
+        if (count($search_criteria) > 0) {
+            $search_criteria = [['link' => 'AND', 'criteria' => $search_criteria]];
+        }
+        if (is_array($dates_value) && count($dates_value) === 2) {
+            try {
+                $search_criteria[] = [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'morethan',
+                    'value'      => (new DateTimeImmutable((string) $dates_value[0]))->setTime(0, 0)->modify('-1 second')->format('Y-m-d H:i:s'),
+                ];
+                $search_criteria[] = [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'lessthan',
+                    'value'      => (new DateTimeImmutable((string) $dates_value[1]))->setTime(0, 0)->modify('+1 day')->format('Y-m-d H:i:s'),
+                ];
+            } catch (\Exception) {
+                // keep the search without dates bounds if the filter values are not parsable dates
+            }
+        }
+        $url       = Ticket::getSearchURL();
+        $build_url = (static fn(int $sla_id, int $is_late): string => $url . (str_contains($url, '?') ? '&' : '?') . Toolbox::append_params([
+            'criteria' => array_merge([
+                [
+                    'link'       => 'AND',
+                    'field'      => 30, // SLA time to resolve
+                    'searchtype' => 'equals',
+                    'value'      => $sla_id,
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 82, // time to resolve exceeded
+                    'searchtype' => 'equals',
+                    'value'      => $is_late,
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 12, // status
+                    'searchtype' => 'equals',
+                    'value'      => $filtered_status > 0 ? $filtered_status : 'old',
+                ],
+            ], $search_criteria),
+            'reset'    => 'reset',
+        ]));
+
+        // Both series are always returned, in a fixed order, so colors stay consistent
+        $series = [];
+        foreach ([0 => __('On time'), 1 => __('Late')] as $is_late => $serie_name) {
+            $serie = ['name' => $serie_name, 'data' => []];
+            foreach (array_keys($slas) as $sla_id) {
+                $serie['data'][] = [
+                    'value' => $counts[$sla_id][$is_late] ?? 0,
+                    'url'   => $build_url($sla_id, $is_late),
+                ];
+            }
+            $series[] = $serie;
+        }
+
+        return [
+            'data'  => [
+                'labels' => array_values($slas),
+                'series' => $series,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
+     * Count solved and closed tickets with a SLA (time to resolve) grouped by their category,
+     * split between the tickets solved on time and the ones solved late.
+     * Categories are sorted by ascending number of tickets: the widget limit keeps the last ones,
+     * so the top categories are displayed.
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public static function ticketsBySlaAndCategory(array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => "ti ti-stopwatch",
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        $no_data = [
+            'data'  => [
+                'labels' => [],
+                'series' => [],
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return $no_data;
+        }
+
+        // A dashboard status filter would be merged into the IN() list, intersect it with solved statuses instead
+        $solved_statuses  = array_merge(Ticket::getSolvedStatusArray(), Ticket::getClosedStatusArray());
+        $queried_statuses = $solved_statuses;
+        $filtered_status  = (int) ($params['apply_filters'][TicketStatusFilter::getId()] ?? 0);
+        unset($params['apply_filters'][TicketStatusFilter::getId()]);
+        if ($filtered_status > 0) {
+            $queried_statuses = array_values(array_intersect($solved_statuses, [$filtered_status]));
+        }
+        if (count($queried_statuses) === 0) {
+            return $no_data;
+        }
+
+        $ticket_table   = Ticket::getTable();
+        $category_table = \ITILCategory::getTable();
+        // Same computation as the "Time to resolve exceeded" search option
+        $late_expression = Ticket::generateSLAOLAComputation('time_to_resolve', $ticket_table);
+        if (!$late_expression instanceof QueryExpression) {
+            return $no_data;
+        }
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        $criteria = array_merge_recursive(
+            [
+                'SELECT'    => [
+                    "$category_table.id AS category_id",
+                    "$category_table.completename AS category_name",
+                    QueryFunction::if(
+                        condition: $late_expression,
+                        true_expression: new QueryExpression('1'),
+                        false_expression: new QueryExpression('0'),
+                        alias: 'is_late'
+                    ),
+                    'COUNT DISTINCT' => "$ticket_table.id AS cpt",
+                ],
+                'FROM'      => $ticket_table,
+                'LEFT JOIN' => [
+                    $category_table => [
+                        'ON' => [
+                            $category_table => 'id',
+                            $ticket_table   => 'itilcategories_id',
+                        ],
+                    ],
+                ],
+                'WHERE'     => [
+                    "$ticket_table.is_deleted"  => 0,
+                    "$ticket_table.status"      => $queried_statuses,
+                    "$ticket_table.slas_id_ttr" => ['>', 0],
+                ] + getEntitiesRestrictCriteria($ticket_table),
+                'GROUPBY'   => ["$category_table.id", "$category_table.completename", 'is_late'],
+            ],
+            $visibility_criteria,
+            self::getFiltersCriteria($ticket_table, $params['apply_filters'])
+        );
+
+        $categories = [];
+        $counts     = [];
+        foreach ($db->request($criteria) as $result) {
+            $category_id                                   = (int) ($result['category_id'] ?? 0);
+            $categories[$category_id]                      = $result['category_name'] ?? __('None');
+            $counts[$category_id][(int) $result['is_late']] = (int) $result['cpt'];
+        }
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        if (count($categories) === 0) {
+            return $no_data;
+        }
+
+        // Ascending number of tickets, then descending name so the names are alphabetical from the top of a horizontal chart
+        $category_ids = array_keys($categories);
+        usort(
+            $category_ids,
+            static fn(int $a, int $b): int => (array_sum($counts[$a]) <=> array_sum($counts[$b]))
+                ?: strcmp($categories[$b], $categories[$a])
+        );
+
+        // The dates filter search is strict on its first day, while the count includes its first second:
+        // the dates are searched below with the same bounds as the count
+        $search_filters = $params['apply_filters'];
+        $dates_value    = $search_filters[DatesFilter::getId()] ?? null;
+        unset($search_filters[DatesFilter::getId()]);
+        $search_criteria = self::getSearchFiltersCriteria($ticket_table, $search_filters)['criteria'] ?? [];
+        // Some filters are searched with OR criteria (e.g. SLA time to own OR time to resolve),
+        // they are grouped so they can't bypass the other criteria of the search
+        if (count($search_criteria) > 0) {
+            $search_criteria = [['link' => 'AND', 'criteria' => $search_criteria]];
+        }
+        if (is_array($dates_value) && count($dates_value) === 2) {
+            try {
+                $search_criteria[] = [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'morethan',
+                    'value'      => (new DateTimeImmutable((string) $dates_value[0]))->setTime(0, 0)->modify('-1 second')->format('Y-m-d H:i:s'),
+                ];
+                $search_criteria[] = [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'lessthan',
+                    'value'      => (new DateTimeImmutable((string) $dates_value[1]))->setTime(0, 0)->modify('+1 day')->format('Y-m-d H:i:s'),
+                ];
+            } catch (\Exception) {
+                // keep the search without dates bounds if the filter values are not parsable dates
+            }
+        }
+        $url       = Ticket::getSearchURL();
+        $build_url = (static fn(int $category_id, int $is_late): string => $url . (str_contains($url, '?') ? '&' : '?') . Toolbox::append_params([
+            'criteria' => array_merge([
+                [
+                    'link'       => 'AND',
+                    'field'      => 7, // category
+                    'searchtype' => 'equals',
+                    'value'      => $category_id,
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 30, // SLA time to resolve
+                    'searchtype' => 'notequals',
+                    'value'      => 0,
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 82, // time to resolve exceeded
+                    'searchtype' => 'equals',
+                    'value'      => $is_late,
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 12, // status
+                    'searchtype' => 'equals',
+                    'value'      => $filtered_status > 0 ? $filtered_status : 'old',
+                ],
+            ], $search_criteria),
+            'reset'    => 'reset',
+        ]));
+
+        // Both series are always returned, in a fixed order, so colors stay consistent
+        $series = [];
+        foreach ([0 => __('On time'), 1 => __('Late')] as $is_late => $serie_name) {
+            $serie = ['name' => $serie_name, 'data' => []];
+            foreach ($category_ids as $category_id) {
+                $serie['data'][] = [
+                    'value' => $counts[$category_id][$is_late] ?? 0,
+                    'url'   => $build_url($category_id, $is_late),
+                ];
+            }
+            $series[] = $serie;
+        }
+
+        return [
+            'data'  => [
+                'labels' => array_map(static fn(int $category_id): string => $categories[$category_id], $category_ids),
+                'series' => $series,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
 
     /**
      * Get multiple counts of computer by a specific foreign key
@@ -1022,6 +1391,15 @@ class Provider
         ];
         $params = array_merge($default_params, $params);
 
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return [
+                'data'  => ['nodata' => true],
+                'label' => $params['label'],
+                'icon'  => $params['icon'],
+            ];
+        }
+
         $t_table  = Ticket::getTable();
         $statuses = Ticket::getAllStatusArray();
 
@@ -1039,8 +1417,7 @@ class Provider
                 'GROUPBY' => "$t_table.status",
                 'ORDERBY' => "$t_table.status ASC",
             ],
-            // limit count for profiles with limited rights
-            Ticket::getCriteriaFromProfile(),
+            $visibility_criteria,
             self::getFiltersCriteria($t_table, $params['apply_filters'])
         );
         Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
@@ -1183,6 +1560,196 @@ class Provider
     }
 
     /**
+     * Count number of computers of an operating system family (Windows, Linux or macOS),
+     * grouped by operating system and version, by operating system only, or by major version.
+     *
+     * @param string $family 'windows', 'linux' or 'macos', matched on the operating system name
+     * @param string $group_by 'version', 'name' or 'major' (major version, e.g. "14" or "10.15" for macOS)
+     * @param array<string, mixed> $params
+     *
+     * @return array<string, mixed>
+     */
+    public static function computersByOperatingSystemVersion(
+        string $family = 'windows',
+        string $group_by = 'version',
+        array $params = []
+    ): array {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => Computer::getIcon(),
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        $no_data = [
+            'data'  => [
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        $families_names = [
+            'windows' => ['Windows'],
+            'linux'   => ['Linux', 'Ubuntu', 'Debian', 'Fedora', 'openSUSE'],
+            'macos'   => ['Mac OS', 'macOS'],
+        ];
+        if (!isset($families_names[$family]) || !in_array($group_by, ['version', 'name', 'major'], true) || !Computer::canView()) {
+            return $no_data;
+        }
+
+        $c_table          = Computer::getTable();
+        $ios_table        = Item_OperatingSystem::getTable();
+        $os_table         = OperatingSystem::getTable();
+        $os_version_table = OperatingSystemVersion::getTable();
+
+        $family_where = [];
+        foreach ($families_names[$family] as $name) {
+            $family_where[] = ["$os_table.name" => ['LIKE', '%' . $name . '%']];
+        }
+
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        $criteria = array_merge_recursive(
+            [
+                'SELECT'     => [
+                    "$os_table.id AS os_id",
+                    "$os_table.name AS os_name",
+                    "$os_version_table.id AS version_id",
+                    "$os_version_table.name AS version_name",
+                    'COUNT DISTINCT' => "$c_table.id AS cpt",
+                ],
+                'FROM'       => $c_table,
+                'INNER JOIN' => [
+                    $ios_table => [
+                        'ON' => [
+                            $ios_table => 'items_id',
+                            $c_table   => 'id',
+                            [
+                                'AND' => [
+                                    "$ios_table.itemtype" => Computer::class,
+                                ],
+                            ],
+                        ],
+                    ],
+                    $os_table => [
+                        'ON' => [
+                            $os_table  => 'id',
+                            $ios_table => 'operatingsystems_id',
+                        ],
+                    ],
+                ],
+                'LEFT JOIN'  => [
+                    $os_version_table => [
+                        'ON' => [
+                            $os_version_table => 'id',
+                            $ios_table        => 'operatingsystemversions_id',
+                        ],
+                    ],
+                ],
+                'WHERE'      => [
+                    "$c_table.is_deleted"  => 0,
+                    "$c_table.is_template" => 0,
+                    ['OR' => $family_where],
+                ] + getEntitiesRestrictCriteria($c_table, '', '', true),
+                'GROUPBY'    => $group_by === 'name'
+                    ? ["$os_table.id", "$os_table.name"]
+                    : ["$os_table.id", "$os_table.name", "$os_version_table.id", "$os_version_table.name"],
+            ],
+            self::getFiltersCriteria($c_table, $params['apply_filters'])
+        );
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        // Each entry gets its count and the versions to search
+        $entries = [];
+        foreach ($db->request($criteria) as $result) {
+            $os_id        = (int) $result['os_id'];
+            $version_id   = (int) ($result['version_id'] ?? 0);
+            $version_name = (string) ($result['version_name'] ?? '');
+            switch ($group_by) {
+                case 'name':
+                    $key   = (string) $os_id;
+                    $label = $result['os_name'];
+                    break;
+                case 'major':
+                    // macOS 10.x major versions are "10.x", the next ones are "11", "12"...
+                    $major = preg_match('/^\s*(10\.\d+|\d+)/', $version_name, $matches) ? $matches[1] : '';
+                    $key   = $os_id . '-' . $major;
+                    $label = $major !== '' ? sprintf('%s %s', $result['os_name'], $major) : sprintf(__('%1$s (%2$s)'), $result['os_name'], __('None'));
+                    break;
+                default:
+                    $key   = $os_id . '-' . $version_id;
+                    $label = $version_name !== '' ? sprintf('%s %s', $result['os_name'], $version_name) : sprintf(__('%1$s (%2$s)'), $result['os_name'], __('None'));
+                    break;
+            }
+            $entries[$key] ??= [
+                'label'       => $label,
+                'number'      => 0,
+                'os_id'       => $os_id,
+                'version_ids' => [],
+            ];
+            $entries[$key]['number']       += (int) $result['cpt'];
+            $entries[$key]['version_ids'][] = $version_id;
+        }
+
+        if (count($entries) === 0) {
+            return $no_data;
+        }
+
+        usort(
+            $entries,
+            static fn(array $a, array $b): int => ($b['number'] <=> $a['number']) ?: strcmp($a['label'], $b['label'])
+        );
+
+        $search_criteria = self::getSearchFiltersCriteria($c_table, $params['apply_filters'])['criteria'] ?? [];
+        // Some filters may be searched with OR criteria, they are grouped so they can't bypass the other criteria
+        if (count($search_criteria) > 0) {
+            $search_criteria = [['link' => 'AND', 'criteria' => $search_criteria]];
+        }
+        $url = Computer::getSearchURL();
+
+        $data = [];
+        foreach ($entries as $entry) {
+            $entry_criteria = [
+                [
+                    'link'       => 'AND',
+                    'field'      => 45, // operating system name
+                    'searchtype' => 'equals',
+                    'value'      => $entry['os_id'],
+                ],
+            ];
+            if ($group_by !== 'name') {
+                $versions_criteria = [];
+                foreach (array_unique($entry['version_ids']) as $version_id) {
+                    $versions_criteria[] = [
+                        'link'       => 'OR',
+                        'field'      => 46, // operating system version
+                        'searchtype' => 'equals',
+                        'value'      => $version_id,
+                    ];
+                }
+                $entry_criteria[] = ['link' => 'AND', 'criteria' => $versions_criteria];
+            }
+
+            $data[] = [
+                'number' => $entry['number'],
+                'label'  => $entry['label'],
+                'url'    => $url . (str_contains($url, '?') ? '&' : '?') . Toolbox::append_params([
+                    'criteria' => array_merge($entry_criteria, $search_criteria),
+                    'reset'    => 'reset',
+                ]),
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
      * Count number of tickets grouped by their category and their entity
      * @param array<string, mixed> $params
      * @return array<string, mixed>
@@ -1198,7 +1765,7 @@ class Provider
         ];
         $params = array_merge($default_params, $params);
 
-        $visibility_criteria = self::getVisibleTicketsCriteria();
+        $visibility_criteria = self::getTicketVisibilityCriteria();
         if ($visibility_criteria === null) {
             return [
                 'data'  => [
@@ -1307,7 +1874,7 @@ class Provider
         ];
         $params = array_merge($default_params, $params);
 
-        $visibility_criteria = self::getVisibleTicketsCriteria();
+        $visibility_criteria = self::getTicketVisibilityCriteria();
         if ($visibility_criteria === null) {
             return [
                 'data'  => [
@@ -1425,8 +1992,8 @@ class Provider
             'icon'  => $params['icon'],
         ];
 
-        // Without any ticket right, the profile criteria don't restrict anything
-        if (!Ticket::canView()) {
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
             return $no_data;
         }
 
@@ -1446,7 +2013,7 @@ class Provider
                 ] + getEntitiesRestrictCriteria($ticket_table),
                 'GROUPBY' => "$ticket_table.itilcategories_id",
             ],
-            Ticket::getCriteriaFromProfile(),
+            $visibility_criteria,
             self::getFiltersCriteria($ticket_table, $params['apply_filters'])
         );
         $iterator = $db->request($criteria);
@@ -1562,8 +2129,8 @@ class Provider
             'series' => [],
         ];
 
-        // Without any ticket right, the profile criteria don't restrict anything
-        if (!Ticket::canView()) {
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
             return [
                 'data'  => $data + ['nodata' => true],
                 'label' => $params['label'],
@@ -1609,7 +2176,7 @@ class Provider
                     'GROUPBY'   => ["$category_table.id", "$ticket_table.status"],
                     'ORDERBY'   => "$category_table.completename",
                 ],
-                Ticket::getCriteriaFromProfile(),
+                $visibility_criteria,
                 self::getFiltersCriteria($ticket_table, $params['apply_filters'])
             );
             $iterator = $db->request($criteria);
@@ -1666,8 +2233,8 @@ class Provider
         ];
         $params = array_merge($default_params, $params);
 
-        // Without any ticket right, the profile criteria don't restrict anything
-        if (!Ticket::canView()) {
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
             return [
                 'data'  => ['nodata' => true],
                 'label' => $params['label'],
@@ -1721,7 +2288,7 @@ class Provider
                 'ORDERBY'   => "cpt DESC",
                 'LIMIT'     => $params['limit'],
             ],
-            Ticket::getCriteriaFromProfile(),
+            $visibility_criteria,
             self::getFiltersCriteria($ticket_table, $params['apply_filters'])
         );
         $iterator = $db->request($criteria);
@@ -1888,6 +2455,138 @@ class Provider
     }
 
     /**
+     * Count tickets in two slices: not solved yet (new, processing, pending) and solved or closed.
+     *
+     * @param array<string, mixed> $params
+     *
+     * @return array<string, mixed>
+     */
+    public static function ticketsOpenedAndClosed(array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => Ticket::getIcon(),
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return [
+                'data'  => ['nodata' => true],
+                'label' => $params['label'],
+                'icon'  => $params['icon'],
+            ];
+        }
+
+        $t_table = Ticket::getTable();
+        $slices  = [
+            'notold' => [
+                'label'    => _x('status', 'Not solved'),
+                'statuses' => Ticket::getNotSolvedStatusArray(),
+            ],
+            'old'    => [
+                'label'    => _x('status', 'Solved + Closed'),
+                'statuses' => array_merge(Ticket::getSolvedStatusArray(), Ticket::getClosedStatusArray()),
+            ],
+        ];
+
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        $criteria = array_merge_recursive(
+            [
+                'SELECT'  => [
+                    "$t_table.status AS status",
+                    'COUNT DISTINCT' => "$t_table.id AS cpt",
+                ],
+                'FROM'    => $t_table,
+                'WHERE'   => [
+                    "$t_table.is_deleted" => 0,
+                ] + getEntitiesRestrictCriteria($t_table),
+                'GROUPBY' => "$t_table.status",
+            ],
+            $visibility_criteria,
+            self::getFiltersCriteria($t_table, $params['apply_filters'])
+        );
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        $counts = array_fill_keys(array_keys($slices), 0);
+        foreach ($db->request($criteria) as $result) {
+            foreach ($slices as $key => $slice) {
+                if (in_array((int) $result['status'], $slice['statuses'], true)) {
+                    $counts[$key] += (int) $result['cpt'];
+                }
+            }
+        }
+
+        if (array_sum($counts) === 0) {
+            return [
+                'data'  => ['nodata' => true],
+                'label' => $params['label'],
+                'icon'  => $params['icon'],
+            ];
+        }
+
+        // The dates filter search is strict on its first day, while the count includes its first second:
+        // the dates are searched below with the same bounds as the count
+        $search_filters = $params['apply_filters'];
+        $dates_value    = $search_filters[DatesFilter::getId()] ?? null;
+        unset($search_filters[DatesFilter::getId()]);
+        $search_criteria = self::getSearchFiltersCriteria($t_table, $search_filters)['criteria'] ?? [];
+        // Some filters are searched with OR criteria (e.g. SLA time to own OR time to resolve),
+        // they are grouped so they can't bypass the other criteria of the search
+        if (count($search_criteria) > 0) {
+            $search_criteria = [['link' => 'AND', 'criteria' => $search_criteria]];
+        }
+        if (is_array($dates_value) && count($dates_value) === 2) {
+            try {
+                $search_criteria[] = [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'morethan',
+                    'value'      => (new DateTimeImmutable((string) $dates_value[0]))->setTime(0, 0)->modify('-1 second')->format('Y-m-d H:i:s'),
+                ];
+                $search_criteria[] = [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'lessthan',
+                    'value'      => (new DateTimeImmutable((string) $dates_value[1]))->setTime(0, 0)->modify('+1 day')->format('Y-m-d H:i:s'),
+                ];
+            } catch (\Exception) {
+                // keep the search without dates bounds if the filter values are not parsable dates
+            }
+        }
+        $url = Ticket::getSearchURL();
+
+        $data = [];
+        foreach ($slices as $key => $slice) {
+            $slice_criteria = $search_criteria;
+            $slice_criteria[] = [
+                'link'       => 'AND',
+                'field'      => 12, // status
+                'searchtype' => 'equals',
+                'value'      => $key,
+            ];
+
+            $data[] = [
+                'number' => $counts[$key],
+                'label'  => $slice['label'],
+                'url'    => $url . (str_contains($url, '?') ? '&' : '?') . Toolbox::append_params([
+                    'criteria' => $slice_criteria,
+                    'reset'    => 'reset',
+                ]),
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
      * Get the criteria restricting tickets to the ones the current user can see.
      *
      * Ticket::getCriteriaFromProfile() returns no restriction for a profile that only has
@@ -1951,8 +2650,8 @@ class Provider
             'icon'  => $params['icon'],
         ];
 
-        // Without any ticket right, the profile criteria don't restrict anything
-        if (!Ticket::canView()) {
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
             return $no_data;
         }
 
@@ -2002,7 +2701,7 @@ class Provider
                     "$ticket_table.is_deleted" => 0,
                 ] + getEntitiesRestrictCriteria($ticket_table),
             ],
-            Ticket::getCriteriaFromProfile(),
+            $visibility_criteria,
             self::getFiltersCriteria($ticket_table, $params['apply_filters'])
         );
 
@@ -2092,6 +2791,204 @@ class Provider
     }
 
     /**
+     * Count solved and closed tickets having a SLA (time to resolve) by their opening period,
+     * split between the tickets solved on time and the ones solved late.
+     * @param string $period 'day', 'week', 'month' or 'year'
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public static function ticketsBySlaEvolution(string $period = 'month', array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => "ti ti-stopwatch",
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        // SQL and PHP formats must produce the same period keys (ISO weeks start on monday)
+        $periods_specs = [
+            'day'   => ['sql' => '%Y-%m-%d', 'php' => 'Y-m-d',  'start' => 'today',             'step' => '+1 day', 'unit' => 'day',   'default_range' => '-29 days'],
+            'week'  => ['sql' => '%x-W%v',   'php' => 'o-\WW',  'start' => 'monday this week',  'step' => '+1 week', 'unit' => 'week',  'default_range' => '-11 weeks'],
+            'month' => ['sql' => '%Y-%m',    'php' => 'Y-m',    'start' => 'first day of this month', 'step' => '+1 month', 'unit' => 'month', 'default_range' => '-11 months'],
+            'year'  => ['sql' => '%Y',       'php' => 'Y',      'start' => 'first day of january this year', 'step' => '+1 year', 'unit' => 'year', 'default_range' => '-4 years'],
+        ];
+        $spec = $periods_specs[$period] ?? $periods_specs['month'];
+        // Avoid unreadable charts and heavy queries on a long range with a short period
+        $max_periods = 366;
+
+        $no_data = [
+            'data'  => [
+                'labels' => [],
+                'series' => [],
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return $no_data;
+        }
+
+        // A dashboard status filter would be merged into the IN() list, intersect it with solved statuses instead
+        $solved_statuses  = array_merge(Ticket::getSolvedStatusArray(), Ticket::getClosedStatusArray());
+        $queried_statuses = $solved_statuses;
+        $filtered_status  = (int) ($params['apply_filters'][TicketStatusFilter::getId()] ?? 0);
+        unset($params['apply_filters'][TicketStatusFilter::getId()]);
+        if ($filtered_status > 0) {
+            $queried_statuses = array_values(array_intersect($solved_statuses, [$filtered_status]));
+        }
+        if (count($queried_statuses) === 0) {
+            return $no_data;
+        }
+
+        // The dates filter defines the displayed range, its periods are computed below
+        $range_end   = new DateTimeImmutable('today');
+        $range_begin = $range_end->modify($spec['default_range']);
+        $dates_value = $params['apply_filters'][DatesFilter::getId()] ?? null;
+        unset($params['apply_filters'][DatesFilter::getId()]);
+        if (is_array($dates_value) && count($dates_value) === 2) {
+            try {
+                $filter_begin = new DateTimeImmutable((string) $dates_value[0]);
+                $filter_end   = new DateTimeImmutable((string) $dates_value[1]);
+                [$range_begin, $range_end] = $filter_begin <= $filter_end
+                    ? [$filter_begin, $filter_end]
+                    : [$filter_end, $filter_begin];
+            } catch (\Exception) {
+                // keep default range if filter values are not parsable dates
+            }
+        }
+
+        // Split the range into periods, aligned on the period start
+        $periods      = [];
+        $period_start = $range_begin->modify($spec['start'])->setTime(0, 0);
+        $last_day     = $range_end->setTime(0, 0);
+        // Start at the first of the last periods, so a very long range doesn't build periods that would be dropped
+        $first_start  = $last_day->modify($spec['start'])->setTime(0, 0)
+            ->modify(sprintf('-%d %s', $max_periods - 1, $spec['unit']));
+        if ($period_start < $first_start) {
+            $period_start = $first_start;
+        }
+        while ($period_start <= $last_day) {
+            $next_start = $period_start->modify($spec['step']);
+            $periods[$period_start->format($spec['php'])] = [
+                'start'        => $period_start->format('Y-m-d H:i:s'),
+                'end'          => $next_start->format('Y-m-d H:i:s'),
+                // The search "morethan" is strict, while the period includes its first second
+                'search_start' => $period_start->modify('-1 second')->format('Y-m-d H:i:s'),
+            ];
+            $period_start = $next_start;
+        }
+        if (count($periods) === 0) {
+            return $no_data;
+        }
+
+        $ticket_table = Ticket::getTable();
+        // Same computation as the "Time to resolve exceeded" search option
+        $late_expression = Ticket::generateSLAOLAComputation('time_to_resolve', $ticket_table);
+        if (!$late_expression instanceof QueryExpression) {
+            return $no_data;
+        }
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        $criteria = array_merge_recursive(
+            [
+                'SELECT'  => [
+                    QueryFunction::dateFormat("$ticket_table.date", $spec['sql'], 'period'),
+                    QueryFunction::if(
+                        condition: $late_expression,
+                        true_expression: new QueryExpression('1'),
+                        false_expression: new QueryExpression('0'),
+                        alias: 'is_late'
+                    ),
+                    'COUNT DISTINCT' => "$ticket_table.id AS cpt",
+                ],
+                'FROM'    => $ticket_table,
+                'WHERE'   => [
+                    "$ticket_table.is_deleted"  => 0,
+                    "$ticket_table.status"      => $queried_statuses,
+                    "$ticket_table.slas_id_ttr" => ['>', 0],
+                    ["$ticket_table.date" => ['>=', reset($periods)['start']]],
+                    ["$ticket_table.date" => ['<', end($periods)['end']]],
+                ] + getEntitiesRestrictCriteria($ticket_table),
+                'GROUPBY' => ['period', 'is_late'],
+            ],
+            $visibility_criteria,
+            self::getFiltersCriteria($ticket_table, $params['apply_filters'])
+        );
+
+        $counts = [];
+        foreach ($db->request($criteria) as $result) {
+            $counts[$result['period']][(int) $result['is_late']] = (int) $result['cpt'];
+        }
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        $search_criteria = self::getSearchFiltersCriteria($ticket_table, $params['apply_filters'])['criteria'] ?? [];
+        // Some filters are searched with OR criteria (e.g. SLA time to own OR time to resolve),
+        // they are grouped so they can't bypass the other criteria of the search
+        if (count($search_criteria) > 0) {
+            $search_criteria = [['link' => 'AND', 'criteria' => $search_criteria]];
+        }
+        $url       = Ticket::getSearchURL();
+        $build_url = (static fn(int $is_late, array $dates): string => $url . (str_contains($url, '?') ? '&' : '?') . Toolbox::append_params([
+            'criteria' => array_merge([
+                [
+                    'link'       => 'AND',
+                    'field'      => 30, // SLA time to resolve
+                    'searchtype' => 'notequals',
+                    'value'      => 0,
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 82, // time to resolve exceeded
+                    'searchtype' => 'equals',
+                    'value'      => $is_late,
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 12, // status
+                    'searchtype' => 'equals',
+                    'value'      => $filtered_status > 0 ? $filtered_status : 'old',
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'morethan',
+                    'value'      => $dates['search_start'],
+                ], [
+                    'link'       => 'AND',
+                    'field'      => 15, // creation date
+                    'searchtype' => 'lessthan',
+                    'value'      => $dates['end'],
+                ],
+            ], $search_criteria),
+            'reset'    => 'reset',
+        ]));
+
+        // Both series are always returned, in a fixed order, so colors stay consistent
+        $series = [];
+        foreach ([0 => __('On time'), 1 => __('Late')] as $is_late => $serie_name) {
+            $serie = ['name' => $serie_name, 'data' => []];
+            foreach ($periods as $period_key => $dates) {
+                $serie['data'][] = [
+                    'value' => $counts[$period_key][$is_late] ?? 0,
+                    'url'   => $build_url($is_late, $dates),
+                ];
+            }
+            $series[] = $serie;
+        }
+
+        return [
+            'data'  => [
+                'labels' => array_map('strval', array_keys($periods)),
+                'series' => $series,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
      * count number of opened and closed tickets grouped by their assigned group
      * @param array<string, mixed> $params
      * @return array<string, mixed>
@@ -2129,28 +3026,17 @@ class Provider
         ];
         $params = array_merge($default_params, $params);
 
-        // The profile criteria don't restrict anything for a profile that only has the UPDATE right,
-        // only the READNEWTICKET right (handled with READASSIGN only), or no right at all
-        $visibility_criteria = [];
-        if (!Session::haveRight(Ticket::$rightname, Ticket::READALL)) {
-            $visibility_criteria = Ticket::getCriteriaFromProfile();
-            if (
-                Session::haveRight(Ticket::$rightname, Ticket::READNEWTICKET)
-                && !Session::haveRight(Ticket::$rightname, Ticket::READASSIGN)
-            ) {
-                $visibility_criteria['WHERE'][0]['OR'][] = [Ticket::getTable() . '.status' => Ticket::INCOMING];
-            }
-            if (!isset($visibility_criteria['WHERE'])) {
-                return [
-                    'data'  => [
-                        'labels' => [],
-                        'series' => [],
-                        'nodata' => true,
-                    ],
-                    'label' => $params['label'],
-                    'icon'  => $params['icon'],
-                ];
-            }
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return [
+                'data'  => [
+                    'labels' => [],
+                    'series' => [],
+                    'nodata' => true,
+                ],
+                'label' => $params['label'],
+                'icon'  => $params['icon'],
+            ];
         }
 
         $ticket_table       = Ticket::getTable();
@@ -2236,31 +3122,6 @@ class Provider
     }
 
     /**
-     * Get the criteria restricting tickets to the ones the current user can see.
-     *
-     * Ticket::getCriteriaFromProfile() returns no restriction for a profile that only has
-     * the UPDATE right, only the READNEWTICKET right (handled with READASSIGN only), or no right at all.
-     *
-     * @return array<string, mixed>|null criteria to merge into the query, null if no ticket is visible
-     */
-    private static function getVisibleTicketsCriteria(): ?array
-    {
-        if (Session::haveRight(Ticket::$rightname, Ticket::READALL)) {
-            return [];
-        }
-
-        $criteria = Ticket::getCriteriaFromProfile();
-        if (
-            Session::haveRight(Ticket::$rightname, Ticket::READNEWTICKET)
-            && !Session::haveRight(Ticket::$rightname, Ticket::READASSIGN)
-        ) {
-            $criteria['WHERE'][0]['OR'][] = [Ticket::getTable() . '.status' => Ticket::INCOMING];
-        }
-
-        return isset($criteria['WHERE']) ? $criteria : null;
-    }
-
-    /**
      * Count tickets grouped by their assigned group, with one serie per status.
      * A ticket assigned to several groups is counted in each of them,
      * tickets without any assigned group are counted in a "None" row.
@@ -2288,7 +3149,7 @@ class Provider
             'icon'  => $params['icon'],
         ];
 
-        $visibility_criteria = self::getVisibleTicketsCriteria();
+        $visibility_criteria = self::getTicketVisibilityCriteria();
         if ($visibility_criteria === null) {
             return $no_data;
         }
@@ -2953,20 +3814,9 @@ class Provider
             'icon'  => $params['icon'],
         ];
 
-        // The profile criteria don't restrict anything for a profile that only has the UPDATE right,
-        // only the READNEWTICKET right (handled with READASSIGN only), or no right at all
-        $visibility_criteria = [];
-        if (!Session::haveRight(Ticket::$rightname, Ticket::READALL)) {
-            $visibility_criteria = Ticket::getCriteriaFromProfile();
-            if (
-                Session::haveRight(Ticket::$rightname, Ticket::READNEWTICKET)
-                && !Session::haveRight(Ticket::$rightname, Ticket::READASSIGN)
-            ) {
-                $visibility_criteria['WHERE'][0]['OR'][] = [Ticket::getTable() . '.status' => Ticket::INCOMING];
-            }
-            if (!isset($visibility_criteria['WHERE'])) {
-                return $no_data;
-            }
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return $no_data;
         }
 
         // The dates filter defines the displayed range, its periods are computed below
@@ -3078,6 +3928,175 @@ class Provider
             'data'  => [
                 'labels' => array_map('strval', array_keys($periods)),
                 'series' => $series,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
+     * Compute, for the tickets opened in each period, the average ratio between
+     * the total duration of their tasks and their solve delay (in percent).
+     * Only solved tickets with at least one task visible by the current user are taken into account.
+     * @param string $period 'day', 'week', 'month' or 'year'
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public static function ticketsActionTimeVsSolveDelay(string $period = 'month', array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => "ti ti-stopwatch",
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        // SQL and PHP formats must produce the same period keys (ISO weeks start on monday)
+        $periods_specs = [
+            'day'   => ['sql' => '%Y-%m-%d', 'php' => 'Y-m-d',  'start' => 'today',             'step' => '+1 day', 'unit' => 'day',   'default_range' => '-29 days'],
+            'week'  => ['sql' => '%x-W%v',   'php' => 'o-\WW',  'start' => 'monday this week',  'step' => '+1 week', 'unit' => 'week',  'default_range' => '-11 weeks'],
+            'month' => ['sql' => '%Y-%m',    'php' => 'Y-m',    'start' => 'first day of this month', 'step' => '+1 month', 'unit' => 'month', 'default_range' => '-11 months'],
+            'year'  => ['sql' => '%Y',       'php' => 'Y',      'start' => 'first day of january this year', 'step' => '+1 year', 'unit' => 'year', 'default_range' => '-4 years'],
+        ];
+        $spec = $periods_specs[$period] ?? $periods_specs['month'];
+        // Avoid unreadable charts and heavy queries on a long range with a short period
+        $max_periods = 366;
+
+        $no_data = [
+            'data'  => [
+                'labels' => [],
+                'series' => [],
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null) {
+            return $no_data;
+        }
+
+        // The dates filter defines the displayed range, its periods are computed below
+        $range_end   = new DateTimeImmutable('today');
+        $range_begin = $range_end->modify($spec['default_range']);
+        $dates_value = $params['apply_filters'][DatesFilter::getId()] ?? null;
+        unset($params['apply_filters'][DatesFilter::getId()]);
+        if (is_array($dates_value) && count($dates_value) === 2) {
+            try {
+                $filter_begin = new DateTimeImmutable((string) $dates_value[0]);
+                $filter_end   = new DateTimeImmutable((string) $dates_value[1]);
+                [$range_begin, $range_end] = $filter_begin <= $filter_end
+                    ? [$filter_begin, $filter_end]
+                    : [$filter_end, $filter_begin];
+            } catch (\Exception) {
+                // keep default range if filter values are not parsable dates
+            }
+        }
+
+        // Split the range into periods, aligned on the period start
+        $periods      = [];
+        $period_start = $range_begin->modify($spec['start'])->setTime(0, 0);
+        $last_day     = $range_end->setTime(0, 0);
+        // Start at the first of the last periods, so a very long range doesn't build periods that would be dropped
+        $first_start  = $last_day->modify($spec['start'])->setTime(0, 0)
+            ->modify(sprintf('-%d %s', $max_periods - 1, $spec['unit']));
+        if ($period_start < $first_start) {
+            $period_start = $first_start;
+        }
+        while ($period_start <= $last_day) {
+            $next_start = $period_start->modify($spec['step']);
+            $periods[$period_start->format($spec['php'])] = [
+                'start' => $period_start->format('Y-m-d H:i:s'),
+                'end'   => $next_start->format('Y-m-d H:i:s'),
+            ];
+            $period_start = $next_start;
+        }
+        if (count($periods) === 0) {
+            return $no_data;
+        }
+
+        $ticket_table = Ticket::getTable();
+        $task_table   = TicketTask::getTable();
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        // Only the tasks the current user can see are summed, with the same rules as CommonITILTask::canViewItem()
+        $task_where = ["$task_table.tickets_id" => new QueryIdentifier("$ticket_table.id")];
+        if (!Session::haveRight(TicketTask::$rightname, TicketTask::SEEPRIVATE)) {
+            $visible_tasks = [
+                "$task_table.users_id"      => Session::getLoginUserID(),
+                "$task_table.users_id_tech" => Session::getLoginUserID(),
+            ];
+            if (Session::haveRight(TicketTask::$rightname, TicketTask::SEEPUBLIC)) {
+                $visible_tasks["$task_table.is_private"] = 0;
+            }
+            if (count($_SESSION['glpigroups'] ?? []) > 0) {
+                $visible_tasks["$task_table.groups_id_tech"] = $_SESSION['glpigroups'];
+            }
+            $task_where[] = ['OR' => $visible_tasks];
+        }
+
+        // Tasks are summed in a subquery, so that the joins added by the visibility and the filters can't count them several times
+        $tickets_criteria = array_merge_recursive(
+            [
+                'DISTINCT' => true,
+                'SELECT'   => [
+                    "$ticket_table.id",
+                    "$ticket_table.solve_delay_stat",
+                    QueryFunction::dateFormat("$ticket_table.date", $spec['sql'], 'period'),
+                    new QuerySubQuery([
+                        'SELECT' => QueryFunction::sum("$task_table.actiontime"),
+                        'FROM'   => $task_table,
+                        'WHERE'  => $task_where,
+                    ], 'actiontime'),
+                ],
+                'FROM'     => $ticket_table,
+                'WHERE'    => [
+                    "$ticket_table.is_deleted"       => 0,
+                    "$ticket_table.solve_delay_stat" => ['>', 0],
+                    ["$ticket_table.date" => ['>=', reset($periods)['start']]],
+                    ["$ticket_table.date" => ['<', end($periods)['end']]],
+                ] + getEntitiesRestrictCriteria($ticket_table),
+            ],
+            $visibility_criteria,
+            self::getFiltersCriteria($ticket_table, $params['apply_filters'])
+        );
+
+        // Tickets without any task have a NULL action time, ignored by the average
+        $criteria = [
+            'SELECT'  => [
+                'ticket_times.period',
+                QueryFunction::round(
+                    QueryFunction::avg(new QueryExpression('`ticket_times`.`actiontime` * 100 / `ticket_times`.`solve_delay_stat`')),
+                    1,
+                    'time_percent'
+                ),
+            ],
+            'FROM'    => new QuerySubQuery($tickets_criteria, 'ticket_times'),
+            'GROUPBY' => ['ticket_times.period'],
+        ];
+
+        $percents = [];
+        foreach ($db->request($criteria) as $result) {
+            if ($result['time_percent'] !== null) {
+                $percents[$result['period']] = (float) $result['time_percent'];
+            }
+        }
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        $serie = [
+            'name' => __("Tasks duration / solve delay (%)"),
+            'data' => [],
+        ];
+        foreach (array_keys($periods) as $period_key) {
+            $serie['data'][] = $percents[$period_key] ?? 0.0;
+        }
+
+        return [
+            'data'  => [
+                'labels' => array_map('strval', array_keys($periods)),
+                'series' => [$serie],
             ],
             'label' => $params['label'],
             'icon'  => $params['icon'],
@@ -3474,6 +4493,321 @@ class Provider
         if (count($data) === 0) {
             $data = [
                 'nodata' => true,
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
+     * Count computers grouped by their number of connected monitors.
+     * Only the monitors the user can see are counted (not deleted, not templates, in the active entities),
+     * computers without any monitor are counted in the "0 monitor" entry.
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public static function computersByMonitorsNumber(array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => Monitor::getIcon(),
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        $no_data = [
+            'data'  => [
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        if (!Computer::canView() || !Monitor::canView()) {
+            return $no_data;
+        }
+
+        $c_table          = Computer::getTable();
+        $monitor_table    = Monitor::getTable();
+        $connection_table = Asset_PeripheralAsset::getTable();
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        // Monitors are counted in a subquery, so that the joins added by the filters can't count them several times
+        $computers_criteria = array_merge_recursive(
+            [
+                'DISTINCT' => true,
+                'SELECT'   => [
+                    "$c_table.id",
+                    new QuerySubQuery([
+                        'COUNT'      => 'cpt',
+                        'FROM'       => $connection_table,
+                        'INNER JOIN' => [
+                            $monitor_table => [
+                                'ON' => [
+                                    $monitor_table    => 'id',
+                                    $connection_table => 'items_id_peripheral',
+                                ],
+                            ],
+                        ],
+                        'WHERE'      => [
+                            "$connection_table.itemtype_asset"      => Computer::class,
+                            "$connection_table.items_id_asset"      => new QueryIdentifier("$c_table.id"),
+                            "$connection_table.itemtype_peripheral" => Monitor::class,
+                            "$connection_table.is_deleted"          => 0,
+                            "$monitor_table.is_deleted"             => 0,
+                            "$monitor_table.is_template"            => 0,
+                        ] + getEntitiesRestrictCriteria($monitor_table, '', '', true),
+                    ], 'nb_monitors'),
+                ],
+                'FROM'     => $c_table,
+                'WHERE'    => [
+                    "$c_table.is_deleted"  => 0,
+                    "$c_table.is_template" => 0,
+                ] + getEntitiesRestrictCriteria($c_table, '', '', true),
+            ],
+            self::getFiltersCriteria($c_table, $params['apply_filters'])
+        );
+
+        $criteria = [
+            'SELECT'  => ['computer_monitors.nb_monitors'],
+            'COUNT'   => 'cpt',
+            'FROM'    => new QuerySubQuery($computers_criteria, 'computer_monitors'),
+            'GROUPBY' => ['computer_monitors.nb_monitors'],
+        ];
+
+        $counts = [];
+        foreach ($db->request($criteria) as $result) {
+            $counts[(int) $result['nb_monitors']] = (int) $result['cpt'];
+        }
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        if (count($counts) === 0) {
+            return $no_data;
+        }
+
+        // Fill the missing numbers of monitors, so the bars stay in order without gaps
+        $data = [];
+        for ($nb_monitors = 0; $nb_monitors <= max(array_keys($counts)); $nb_monitors++) {
+            $data[] = [
+                'number' => $counts[$nb_monitors] ?? 0,
+                'label'  => sprintf(_n('%d monitor', '%d monitors', $nb_monitors), $nb_monitors),
+                'url'    => '',
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
+     * Count tickets grouped by the number of times their assigned group changed.
+     * The changes are read from the ticket history: each assigned group added after the first one
+     * is a change. Tickets that never had an assigned group are not counted.
+     * As it is built from the history, the right to read the history is required.
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public static function ticketsByAssignedGroupChanges(array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => Group::getIcon(),
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        $no_data = [
+            'data'  => [
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        $visibility_criteria = self::getTicketVisibilityCriteria();
+        if ($visibility_criteria === null || !Log::canView()) {
+            return $no_data;
+        }
+
+        $ticket_table = Ticket::getTable();
+        $log_table    = Log::getTable();
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        // Group additions are counted in a subquery, so that the joins added by the visibility and the filters can't count them several times
+        $tickets_criteria = array_merge_recursive(
+            [
+                'DISTINCT' => true,
+                'SELECT'   => [
+                    "$ticket_table.id",
+                    new QuerySubQuery([
+                        'COUNT'  => 'cpt',
+                        'FROM'   => $log_table,
+                        'WHERE'  => [
+                            "$log_table.itemtype"         => Ticket::class,
+                            "$log_table.items_id"         => new QueryIdentifier("$ticket_table.id"),
+                            "$log_table.itemtype_link"    => Group::class,
+                            "$log_table.linked_action"    => Log::HISTORY_ADD_RELATION,
+                            // Assigned group, see CommonITILActor::getForceLogOption(): requester and observer groups have their own option
+                            "$log_table.id_search_option" => 8,
+                        ],
+                    ], 'nb_added_groups'),
+                ],
+                'FROM'     => $ticket_table,
+                'WHERE'    => [
+                    "$ticket_table.is_deleted" => 0,
+                ] + getEntitiesRestrictCriteria($ticket_table),
+            ],
+            $visibility_criteria,
+            self::getFiltersCriteria($ticket_table, $params['apply_filters'])
+        );
+
+        $criteria = [
+            'SELECT'  => ['ticket_groups.nb_added_groups'],
+            'COUNT'   => 'cpt',
+            'FROM'    => new QuerySubQuery($tickets_criteria, 'ticket_groups'),
+            'WHERE'   => ['ticket_groups.nb_added_groups' => ['>', 0]],
+            'GROUPBY' => ['ticket_groups.nb_added_groups'],
+        ];
+
+        $counts = [];
+        foreach ($db->request($criteria) as $result) {
+            $counts[(int) $result['nb_added_groups'] - 1] = (int) $result['cpt'];
+        }
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        if (count($counts) === 0) {
+            return $no_data;
+        }
+
+        // Fill the missing numbers of changes, so the bars stay in order without gaps
+        $data = [];
+        for ($nb_changes = 0; $nb_changes <= max(array_keys($counts)); $nb_changes++) {
+            $data[] = [
+                'number' => $counts[$nb_changes] ?? 0,
+                'label'  => sprintf(_n('%d change', '%d changes', $nb_changes), $nb_changes),
+                'url'    => '',
+            ];
+        }
+
+        return [
+            'data'  => $data,
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+    }
+
+    /**
+     * Count computers grouped by the version of their inventory agent.
+     * Computers without agent are not counted.
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public static function computersByAgentVersion(array $params = []): array
+    {
+        $db = DBConnection::getReadConnection();
+
+        $default_params = [
+            'label'         => "",
+            'icon'          => Agent::getIcon(),
+            'apply_filters' => [],
+        ];
+        $params = array_merge($default_params, $params);
+
+        $no_data = [
+            'data'  => [
+                'nodata' => true,
+            ],
+            'label' => $params['label'],
+            'icon'  => $params['icon'],
+        ];
+
+        if (!Computer::canView() || !Agent::canView()) {
+            return $no_data;
+        }
+
+        $c_table     = Computer::getTable();
+        $agent_table = Agent::getTable();
+        Profiler::getInstance()->start(__METHOD__ . ' build SQL criteria');
+        $criteria = array_merge_recursive(
+            [
+                'SELECT'     => [
+                    "$agent_table.version",
+                    'COUNT DISTINCT' => "$c_table.id AS cpt",
+                ],
+                'FROM'       => $c_table,
+                'INNER JOIN' => [
+                    $agent_table => [
+                        'ON' => [
+                            $agent_table => 'items_id',
+                            $c_table     => 'id',
+                            [
+                                'AND' => [
+                                    "$agent_table.itemtype" => Computer::class,
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                'WHERE'      => [
+                    "$c_table.is_deleted"  => 0,
+                    "$c_table.is_template" => 0,
+                ] + getEntitiesRestrictCriteria($c_table, '', '', true),
+                'GROUPBY'    => ["$agent_table.version"],
+            ],
+            self::getFiltersCriteria($c_table, $params['apply_filters'])
+        );
+
+        $counts = [];
+        foreach ($db->request($criteria) as $result) {
+            $version          = (string) ($result['version'] ?? '');
+            $counts[$version] = ($counts[$version] ?? 0) + (int) $result['cpt'];
+        }
+        Profiler::getInstance()->stop(__METHOD__ . ' build SQL criteria');
+
+        if (count($counts) === 0) {
+            return $no_data;
+        }
+
+        // Biggest counts first, then the most recent versions first
+        $versions = array_keys($counts);
+        usort(
+            $versions,
+            static fn(int|string $a, int|string $b): int => ($counts[$b] <=> $counts[$a]) ?: version_compare((string) $b, (string) $a)
+        );
+
+        $search_criteria = self::getSearchFiltersCriteria($c_table, $params['apply_filters'])['criteria'] ?? [];
+        // Some filters may be searched with OR criteria, they are grouped so they can't bypass the other criteria
+        if (count($search_criteria) > 0) {
+            $search_criteria = [['link' => 'AND', 'criteria' => $search_criteria]];
+        }
+        $url = Computer::getSearchURL();
+
+        $data = [];
+        foreach ($versions as $version) {
+            $version = (string) $version;
+            $data[] = [
+                'number' => $counts[$version],
+                'label'  => $version !== '' ? $version : __('None'),
+                'url'    => $url . (str_contains($url, '?') ? '&' : '?') . Toolbox::append_params([
+                    'criteria' => array_merge([
+                        [
+                            'link'       => 'AND',
+                            'field'      => 903, // agent version
+                            'searchtype' => 'contains',
+                            'value'      => '^' . $version . '$',
+                        ],
+                    ], $search_criteria),
+                    'reset'    => 'reset',
+                ]),
             ];
         }
 

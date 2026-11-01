@@ -686,12 +686,6 @@ $ignoreErrors[] = [
 	'path' => __DIR__ . '/front/report.dynamic.php',
 ];
 $ignoreErrors[] = [
-	'message' => '#^Cannot call method checkGlobal\\(\\) on CommonDBTM\\|false\\.$#',
-	'identifier' => 'method.nonObject',
-	'count' => 1,
-	'path' => __DIR__ . '/front/report.dynamic.php',
-];
-$ignoreErrors[] = [
 	'message' => '#^Parameter \\#1 \\$by_itemtype of static method Report\\:\\:showNetworkReport\\(\\) expects \'Glpi\\\\\\\\Socket\'\\|\'Location\'\\|\'NetworkEquioment\'\\|null, \'Glpi\\\\\\\\Socket\'\\|\'Location\'\\|\'NetworkEquipment\'\\|null given\\.$#',
 	'identifier' => 'argument.type',
 	'count' => 1,
@@ -2498,18 +2492,6 @@ $ignoreErrors[] = [
 	'path' => __DIR__ . '/src/CommonITILRecurrent.php',
 ];
 $ignoreErrors[] = [
-	'message' => '#^Parameter \\#2 \\$timestamp of function date expects int\\|null, int\\|false given\\.$#',
-	'identifier' => 'argument.type',
-	'count' => 1,
-	'path' => __DIR__ . '/src/CommonITILRecurrent.php',
-];
-$ignoreErrors[] = [
-	'message' => '#^Parameter \\#3 \\$specifictime of static method Html\\:\\:computeGenericDateTimeSearch\\(\\) expects int\\|string, int\\|false given\\.$#',
-	'identifier' => 'argument.type',
-	'count' => 2,
-	'path' => __DIR__ . '/src/CommonITILRecurrent.php',
-];
-$ignoreErrors[] = [
 	'message' => '#^Building a Glpi\\\\DBAL\\\\QueryExpression from a non\\-literal SQL string is forbidden\\. Use `QueryIdentifier` for an identifier, `QueryValue` for a value, `QueryFunction` or `QuerySubQuery` for a SQL fragment, or pass the dynamic parts through the `values\\:` argument to have them bound as statement parameters\\.$#',
 	'identifier' => 'glpi.forbidNonLiteralSqlExpression',
 	'count' => 3,
@@ -2854,7 +2836,7 @@ $ignoreErrors[] = [
 $ignoreErrors[] = [
 	'message' => '#^Cannot access property \\$fields on CommonDBTM\\|false\\.$#',
 	'identifier' => 'property.nonObject',
-	'count' => 3,
+	'count' => 2,
 	'path' => __DIR__ . '/src/CommonItilObject_Item.php',
 ];
 $ignoreErrors[] = [
@@ -2866,7 +2848,7 @@ $ignoreErrors[] = [
 $ignoreErrors[] = [
 	'message' => '#^Cannot call method getFromDB\\(\\) on CommonDBTM\\|false\\.$#',
 	'identifier' => 'method.nonObject',
-	'count' => 3,
+	'count' => 2,
 	'path' => __DIR__ . '/src/CommonItilObject_Item.php',
 ];
 $ignoreErrors[] = [
@@ -2885,12 +2867,6 @@ $ignoreErrors[] = [
 	'message' => '#^Cannot call method getNameID\\(\\) on CommonDBTM\\|false\\.$#',
 	'identifier' => 'method.nonObject',
 	'count' => 2,
-	'path' => __DIR__ . '/src/CommonItilObject_Item.php',
-];
-$ignoreErrors[] = [
-	'message' => '#^Cannot call method maybeLocated\\(\\) on CommonDBTM\\|false\\.$#',
-	'identifier' => 'method.nonObject',
-	'count' => 1,
 	'path' => __DIR__ . '/src/CommonItilObject_Item.php',
 ];
 $ignoreErrors[] = [
@@ -11654,12 +11630,6 @@ $ignoreErrors[] = [
 	'path' => __DIR__ . '/src/Html.php',
 ];
 $ignoreErrors[] = [
-	'message' => '#^Parameter \\#1 \\$string of static method Html\\:\\:addConfirmationOnAction\\(\\) expects string, array\\|string given\\.$#',
-	'identifier' => 'argument.type',
-	'count' => 1,
-	'path' => __DIR__ . '/src/Html.php',
-];
-$ignoreErrors[] = [
 	'message' => '#^Parameter \\#1 \\.\\.\\.\\$arrays of function array_merge expects array, array\\|string given\\.$#',
 	'identifier' => 'argument.type',
 	'count' => 1,
@@ -13197,12 +13167,6 @@ $ignoreErrors[] = [
 ];
 $ignoreErrors[] = [
 	'message' => '#^Offset \'uuid\' might not exist on array\\{\\}\\|array\\{0\\: non\\-falsy\\-string, uuid\\: non\\-empty\\-string, 1\\: non\\-empty\\-string, 2\\?\\: string, itemtype\\?\\: string, 3\\?\\: string, items_id\\?\\: numeric\\-string, 4\\?\\: numeric\\-string\\}\\.$#',
-	'identifier' => 'offsetAccess.notFound',
-	'count' => 1,
-	'path' => __DIR__ . '/src/MailCollector.php',
-];
-$ignoreErrors[] = [
-	'message' => '#^Offset 1 might not exist on array\\{\\}\\|array\\{non\\-falsy\\-string, numeric\\-string\\}\\.$#',
 	'identifier' => 'offsetAccess.notFound',
 	'count' => 1,
 	'path' => __DIR__ . '/src/MailCollector.php',
@@ -18156,12 +18120,6 @@ $ignoreErrors[] = [
 	'identifier' => 'offsetAccess.invalidOffset',
 	'count' => 1,
 	'path' => __DIR__ . '/src/Webhook.php',
-];
-$ignoreErrors[] = [
-	'message' => '#^Parameter \\#1 \\$string of function strtolower expects string, array\\<int\\|string, array\\<int\\|string, list\\<string\\>\\|string\\>\\|int\\|string\\>\\|string given\\.$#',
-	'identifier' => 'argument.type',
-	'count' => 2,
-	'path' => __DIR__ . '/src/autoload/CFG_GLPI.php',
 ];
 $ignoreErrors[] = [
 	'message' => '#^Function getItemForItemtype\\(\\) should return \\(T of CommonDBTM\\)\\|false but returns CommonDBTM\\|false\\.$#',

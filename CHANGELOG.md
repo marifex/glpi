@@ -6,6 +6,8 @@ The present file will list all changes made to the project; according to the
 ## [13.0.0] unreleased
 
 ### Added
+- Documents, contracts and notes on cables.
+- Date variables (e.g. `{YEAR}`, `{MONTH_NAME+1}`, `{WEEK}` with `{YEAR_OF_WEEK}`) in the predefined title of recurrent tickets and changes, computed from the occurrence date.
 
 ### Changes
 
@@ -24,6 +26,18 @@ The present file will list all changes made to the project; according to the
 #### Deprecated
 
 #### Removed
+- `Session::getNewCSRFToken()`
+- `Session::validateCSRF()`
+- `Session::checkCSRF()`
+- `Session::cleanCSRFTokens()`
+- `csrf_token()` Twig function.
+- `getAjaxCsrfToken()` JavaScript function.
+- `fields.csrfField()` Twig macro in `fields_macros.html.twig`.
+- Support of `javascript:` values for the `add_link` parameter of `components/tab/addlink_block.html.twig`.
+- `Html::addConfirmationOnAction()`. Use the `data-glpi-confirm="<message>"` attribute instead.
+- `Html::getConfirmationOnActionScript()`. Use the `data-glpi-confirm="<message>"` attribute instead.
+- `Html::link()`.
+- `confirmaction` option of `Html::submit()`. Confirmation is now handled through the `data-glpi-confirm` attribute, so no additional action can be run on confirmation.
 
 ## [12.0.1] unreleased
 
@@ -290,6 +304,8 @@ The present file will list all changes made to the project; according to the
 - Default behavior when submitting a Form that has only one destination is now redirecting to created item instead of showing the feedback page. Previous behavior is obtained by unchecking "Go to created item after creation" in General configuration > Default values.
 
 - Webhooks on ITIL tasks now match the entity of their parent item. A non-recursive task webhook defined in the root entity is no longer triggered by tasks of sub-entities: enable "Sub-entities" on the webhook to keep the previous behavior.
+
+- The "Refused equipments" setting of the logs purge now purges the history of refused equipments instead of the refused equipments themselves.
 
 ### Deprecated
 

@@ -344,7 +344,6 @@ $empty_data_builder = new class {
             'use_notifications' => '0',
             'notifications_ajax' => '0',
             'notifications_ajax_check_interval' => '5',
-            'notifications_ajax_sound' => null,
             'notifications_ajax_icon_url' => '/pics/glpi.png',
             'notifications_ajax_expiration_delay' => '7',
             'dbversion' => 'FILLED AT INSTALL',
@@ -6588,7 +6587,7 @@ style="color: #8b8c8f; font-weight: bold; text-decoration: underline;">
             ], [
                 'profiles_id' => self::PROFILE_SUPERVISOR,
                 'name' => 'cable_management',
-                'rights' => READ | UPDATE | CREATE | DELETE | PURGE,
+                'rights' => READ | UPDATE | CREATE | DELETE | PURGE | READNOTE | UPDATENOTE,
             ], [
                 'profiles_id' => self::PROFILE_ADMIN,
                 'name' => 'statistic',
@@ -7486,7 +7485,7 @@ style="color: #8b8c8f; font-weight: bold; text-decoration: underline;">
             ], [
                 'profiles_id' => self::PROFILE_SUPER_ADMIN,
                 'name' => 'cable_management',
-                'rights' => READ | UPDATE | CREATE | DELETE | PURGE,
+                'rights' => READ | UPDATE | CREATE | DELETE | PURGE | READNOTE | UPDATENOTE,
             ], [
                 'profiles_id' => self::PROFILE_TECHNICIAN,
                 'name' => 'statistic',
@@ -7769,7 +7768,7 @@ style="color: #8b8c8f; font-weight: bold; text-decoration: underline;">
             ], [
                 'profiles_id' => self::PROFILE_ADMIN,
                 'name' => 'cable_management',
-                'rights' => READ | UPDATE | CREATE | DELETE | PURGE,
+                'rights' => READ | UPDATE | CREATE | DELETE | PURGE | READNOTE | UPDATENOTE,
             ], [
                 'profiles_id' => self::PROFILE_SUPERVISOR,
                 'name' => 'statistic',
@@ -7973,7 +7972,7 @@ style="color: #8b8c8f; font-weight: bold; text-decoration: underline;">
             ], [
                 'profiles_id' => self::PROFILE_READ_ONLY,
                 'name' => 'cable_management',
-                'rights' => READ,
+                'rights' => READ | READNOTE,
             ], [
                 'profiles_id' => self::PROFILE_READ_ONLY,
                 'name' => 'networking',
